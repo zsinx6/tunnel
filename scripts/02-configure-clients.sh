@@ -56,7 +56,6 @@ if [[ "$REPLY" =~ ^[Yy]$ ]]; then
 [Interface]
 PrivateKey = $(cat ~/wireguard-keys/desktop.key)
 Address = 10.10.0.2/24
-DNS = 1.1.1.1
 
 # LAN isolation: block VPN traffic from being forwarded to the physical LAN.
 # This prevents any VPN peer (e.g. tablet) from pivoting into the home network
@@ -70,7 +69,7 @@ PublicKey    = $(cat ~/wireguard-keys/server.pub)
 PresharedKey = $(cat ~/wireguard-keys/desktop.psk)
 Endpoint     = ${EIP}:51920
 AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 25
+PersistentKeepalive = 30
 WGEOF"
     sudo chmod 600 /etc/wireguard/wg0.conf
     echo "Desktop configured securely. LAN isolation rules embedded for interface: ${PHYS_IF}"
@@ -83,7 +82,6 @@ qrencode -t ansiutf8 <<QREOF
 [Interface]
 PrivateKey = $(cat ~/wireguard-keys/tablet.key)
 Address = 10.10.0.3/24
-DNS = 1.1.1.1
 
 [Peer]
 PublicKey    = $(cat ~/wireguard-keys/server.pub)

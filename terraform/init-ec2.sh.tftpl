@@ -15,7 +15,9 @@ apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt-get install -y wireguard iptables ufw fail2ban python3-systemd
 
-useradd -m -s /bin/bash "$${NEW_USER}"
+# -N: do not create a primary group for the user (avoids conflict with the
+# existing system group 'operator' present on Debian 12).
+id "$${NEW_USER}" &>/dev/null || useradd -m -s /bin/bash -N "$${NEW_USER}"
 usermod -aG sudo "$${NEW_USER}"
 # Restrict passwordless sudo to the specific commands needed for operations.
 echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/wg, /usr/sbin/ufw, /usr/sbin/iptables, /usr/bin/apt-get, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"

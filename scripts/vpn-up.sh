@@ -3,33 +3,14 @@ set -euo pipefail
 
 # ==============================================================================
 # vpn-up.sh
-# Enforces 2FA on local sshd, powers on EC2, and establishes the WireGuard tunnel.
+# Powers on EC2 and establishes the WireGuard tunnel.
+# Prerequisite: sshd 2FA (Google Authenticator + KbdInteractiveAuthentication)
+# must already be configured permanently on the desktop.
 # ==============================================================================
 
 REGION="sa-east-1"
 
-echo "=== 1. Pre-flight: Verifying Local SSH Daemon ==="
-SSHD_CONF="/etc/ssh/sshd_config"
-# Only create the backup once to preserve the truly original config.
-if [ ! -f "${SSHD_CONF}.bak" ]; then
-    sudo cp "$SSHD_CONF" "${SSHD_CONF}.bak"
-    echo "Original sshd_config backed up to ${SSHD_CONF}.bak"
-fi
-
-sudo sed -i 's/^#\?UsePAM.*/UsePAM yes/' "$SSHD_CONF"
-sudo sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' "$SSHD_CONF"
-sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONF"
-
-if ! sudo sshd -t; then
-    echo "CRITICAL: sshd_config syntax error detected! Restoring backup..."
-    sudo mv "${SSHD_CONF}.bak" "$SSHD_CONF"
-    exit 1
-fi
-
-sudo systemctl reload sshd
-echo "Local SSH daemon 2FA settings enforced."
-
-echo "=== 2. Locating WireGuard Bastion on AWS ==="
+echo "=== 1. Locating WireGuard Bastion on AWS ==="
 INSTANCE_ID=$(aws ec2 describe-instances \
     --region "$REGION" \
     --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
@@ -41,7 +22,7 @@ if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
     exit 1
 fi
 
-echo "=== 3. Waking Cloud Infrastructure ==="
+echo "=== 2. Waking Cloud Infrastructure ==="
 # Handle all possible states before calling start-instances:
 #   stopping → wait for fully stopped, then start
 #   pending  → already starting, just wait for running
@@ -82,7 +63,7 @@ case "$INSTANCE_STATE" in
         ;;
 esac
 
-echo "=== 4. Establishing Encrypted Tunnel ==="
+echo "=== 3. Establishing Encrypted Tunnel ==="
 echo "Starting local WireGuard interface..."
 sudo systemctl start wg-quick@wg0
 
