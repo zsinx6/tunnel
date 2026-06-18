@@ -8,7 +8,18 @@ set -euo pipefail
 # ==============================================================================
 
 echo "=== 1. Installing Local Dependencies ==="
-sudo pacman -Syu --needed wireguard-tools aws-cli qrencode terraform
+MISSING_PKGS=()
+command -v wg          &>/dev/null || MISSING_PKGS+=(wireguard-tools)
+command -v aws         &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
+command -v qrencode    &>/dev/null || MISSING_PKGS+=(qrencode)
+command -v terraform   &>/dev/null || MISSING_PKGS+=(terraform)
+
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    echo "Installing missing packages: ${MISSING_PKGS[*]}"
+    sudo pacman -S --needed --noconfirm "${MISSING_PKGS[@]}"
+else
+    echo "All dependencies already installed. Skipping."
+fi
 
 echo "=== 2. Generating Dedicated SSH Key ==="
 SSH_KEY_PATH="$HOME/.ssh/wg_ec2_ed25519"
@@ -39,13 +50,16 @@ echo "=== 4. Generating WireGuard Cryptography ==="
 mkdir -p ~/wireguard-keys && chmod 700 ~/wireguard-keys && cd ~/wireguard-keys
 
 if [ ! -f "server.key" ]; then
-    wg genkey > server.key  && wg pubkey < server.key  > server.pub
-    wg genkey > desktop.key && wg pubkey < desktop.key > desktop.pub
-    wg genkey > tablet.key  && wg pubkey < tablet.key  > tablet.pub
-    # Preshared keys add a post-quantum symmetric layer on top of Curve25519
-    wg genpsk > desktop.psk
-    wg genpsk > tablet.psk
-    chmod 600 server.key desktop.key tablet.key desktop.psk tablet.psk
+    # umask 077 ensures all files are created as 600 (owner read/write only),
+    # silencing wg's "world accessible file" warning and securing keys from creation.
+    (
+        umask 077
+        wg genkey > server.key  && wg pubkey < server.key  > server.pub
+        wg genkey > desktop.key && wg pubkey < desktop.key > desktop.pub
+        wg genkey > tablet.key  && wg pubkey < tablet.key  > tablet.pub
+        wg genpsk > desktop.psk
+        wg genpsk > tablet.psk
+    )
     echo "WireGuard keys and preshared keys generated."
 else
     echo "WireGuard keys already exist in ~/wireguard-keys. Skipping generation."
