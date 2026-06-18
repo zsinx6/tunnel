@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# CLOUD-INIT TEMPLATE
+# Auto-configures Debian 12 as a WireGuard hub: UFW, WireGuard, Fail2Ban,
+# and a boot-time security update service.
+# Logs to /var/log/cloud-init-output.log on the instance.
+# ==============================================================================
+
+NEW_USER="operator"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install -y wireguard iptables ufw fail2ban python3-systemd
+
+useradd -m -s /bin/bash "$${NEW_USER}"
+usermod -aG sudo "$${NEW_USER}"
+# Restrict passwordless sudo to the specific commands needed for operations.
+echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/wg, /usr/sbin/ufw, /usr/sbin/iptables, /usr/bin/apt-get, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"
+chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
+
+mkdir -p "/home/$${NEW_USER}/.ssh"
+echo "${ssh_public_key}" > "/home/$${NEW_USER}/.ssh/authorized_keys"
+chown -R "$${NEW_USER}:$${NEW_USER}" "/home/$${NEW_USER}/.ssh"
+chmod 700 "/home/$${NEW_USER}/.ssh"
+chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys"
+
+cat <<EOM > /etc/sysctl.d/99-security-routing.conf
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+EOM
+sysctl --system
+
+sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 50022/tcp comment 'SSH emergency access'
+ufw allow 51920/udp comment 'WireGuard tunnel'
+ufw allow in on wg0 comment 'Trust internal VPN traffic'
+ufw --force enable
+
+# Detect the default egress interface once at provision time; stable for the lifetime of this instance.
+ETH_IF=$(ip route list default | awk '{print $5}' | head -n 1)
+
+mkdir -p /etc/wireguard
+chmod 700 /etc/wireguard
+cat <<EOM > /etc/wireguard/wg0.conf
+[Interface]
+PrivateKey = ${wg_server_private_key}
+ListenPort = 51920
+Address = 10.10.0.1/24
+
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $${ETH_IF} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $${ETH_IF} -j MASQUERADE
+
+[Peer]
+# Desktop
+PublicKey    = ${wg_desktop_public_key}
+PresharedKey = ${wg_desktop_psk}
+AllowedIPs   = 10.10.0.2/32
+
+[Peer]
+# Tablet
+PublicKey    = ${wg_tablet_public_key}
+PresharedKey = ${wg_tablet_psk}
+AllowedIPs   = 10.10.0.3/32
+EOM
+
+chmod 600 /etc/wireguard/wg0.conf
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+cat <<EOM > /etc/fail2ban/jail.local
+[DEFAULT]
+backend = systemd
+banaction = ufw
+findtime = 10m
+
+[sshd]
+enabled  = true
+port     = 50022
+filter   = sshd
+maxretry = 3
+bantime  = 24h
+EOM
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+sed -i 's/^#\?Port.*/Port 50022/'                               /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'           /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'               /etc/ssh/sshd_config
+sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/' /etc/ssh/sshd_config
+echo "AllowUsers $${NEW_USER}" >> /etc/ssh/sshd_config
+echo "MaxAuthTries 3"          >> /etc/ssh/sshd_config
+echo "LoginGraceTime 30"       >> /etc/ssh/sshd_config
+
+if ! sshd -t; then
+    echo "CRITICAL: sshd_config has a syntax error — check /etc/ssh/sshd_config and fix before rebooting."
+    exit 1
+fi
+systemctl restart ssh
+
+cat << 'EOF' > /usr/local/bin/startup-update.sh
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+if [ -f /var/run/reboot-required ]; then
+    systemctl reboot
+fi
+EOF
+chmod +x /usr/local/bin/startup-update.sh
+
+cat << 'EOF' > /etc/systemd/system/startup-update.service
+[Unit]
+Description=Install security updates on boot
+After=network-online.target
+Wants=network-online.target
+Before=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/startup-update.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable startup-update.service
