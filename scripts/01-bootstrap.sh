@@ -7,12 +7,15 @@ set -euo pipefail
 # Safe to re-run (idempotent).
 # ==============================================================================
 
+# Define your clients here! Just add to this list to provision new devices.
+CLIENTS=("desktop" "tablet" "smartphone")
+
 echo "=== 1. Installing Local Dependencies ==="
 MISSING_PKGS=()
-command -v wg          &>/dev/null || MISSING_PKGS+=(wireguard-tools)
-command -v aws         &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
-command -v qrencode    &>/dev/null || MISSING_PKGS+=(qrencode)
-command -v terraform   &>/dev/null || MISSING_PKGS+=(terraform)
+command -v wg      &>/dev/null || MISSING_PKGS+=(wireguard-tools)
+command -v aws     &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
+command -v qrencode &>/dev/null || MISSING_PKGS+=(qrencode)
+command -v terraform &>/dev/null || MISSING_PKGS+=(terraform)
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing packages: ${MISSING_PKGS[*]}"
@@ -26,7 +29,6 @@ SSH_KEY_PATH="$HOME/.ssh/wg_ec2_ed25519"
 
 if [ ! -f "${SSH_KEY_PATH}.pub" ]; then
     echo "Generating dedicated ED25519 SSH key for the bastion."
-    echo "CRITICAL: Enter a strong passphrase when prompted."
     ssh-keygen -t ed25519 -f "${SSH_KEY_PATH}" -C "wg-ec2-operator"
 else
     echo "Dedicated SSH key already exists at ${SSH_KEY_PATH}. Skipping."
@@ -49,21 +51,23 @@ fi
 echo "=== 4. Generating WireGuard Cryptography ==="
 mkdir -p ~/wireguard-keys && chmod 700 ~/wireguard-keys && cd ~/wireguard-keys
 
+# Ensure secure file creation
+umask 077
+
+# Server Keys
 if [ ! -f "server.key" ]; then
-    # umask 077 ensures all files are created as 600 (owner read/write only),
-    # silencing wg's "world accessible file" warning and securing keys from creation.
-    (
-        umask 077
-        wg genkey > server.key  && wg pubkey < server.key  > server.pub
-        wg genkey > desktop.key && wg pubkey < desktop.key > desktop.pub
-        wg genkey > tablet.key  && wg pubkey < tablet.key  > tablet.pub
-        wg genpsk > desktop.psk
-        wg genpsk > tablet.psk
-    )
-    echo "WireGuard keys and preshared keys generated."
-else
-    echo "WireGuard keys already exist in ~/wireguard-keys. Skipping generation."
+    wg genkey > server.key && wg pubkey < server.key > server.pub
+    echo "Server keys generated."
 fi
+
+# Client Keys
+for client in "${CLIENTS[@]}"; do
+    if [ ! -f "${client}.key" ]; then
+        wg genkey > "${client}.key" && wg pubkey < "${client}.key" > "${client}.pub"
+        wg genpsk > "${client}.psk"
+        echo "Keys generated for new client: ${client}"
+    fi
+done
 
 echo "=== 5. Writing Terraform Variables ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -71,20 +75,21 @@ TF_DIR="${SCRIPT_DIR}/../terraform"
 mkdir -p "${TF_DIR}"
 
 TFVARS="${TF_DIR}/terraform.tfvars"
-if [ -f "$TFVARS" ]; then
-    echo "terraform.tfvars already exists. Skipping to avoid overwriting existing deployment."
-    echo "Delete ${TFVARS} manually and re-run if you want to regenerate it."
-else
-    cat <<EOF > "$TFVARS"
+
+# Overwriting tfvars safely ensures new clients are injected
+cat <<EOF > "$TFVARS"
 ssh_public_key        = "$(cat ${SSH_KEY_PATH}.pub)"
 wg_server_private_key = "$(cat server.key)"
-wg_desktop_public_key = "$(cat desktop.pub)"
-wg_tablet_public_key  = "$(cat tablet.pub)"
-wg_desktop_psk        = "$(cat desktop.psk)"
-wg_tablet_psk         = "$(cat tablet.psk)"
 EOF
-    chmod 600 "$TFVARS"
-    echo "terraform.tfvars written."
-fi
 
-echo "Bootstrap complete. Proceed to run: cd terraform && terraform init && terraform apply"
+for client in "${CLIENTS[@]}"; do
+    echo "wg_${client}_public_key = \"$(cat ${client}.pub)\"" >> "$TFVARS"
+    echo "wg_${client}_psk        = \"$(cat ${client}.psk)\"" >> "$TFVARS"
+done
+
+chmod 600 "$TFVARS"
+echo "terraform.tfvars successfully updated with all current clients."
+
+echo "Bootstrap complete. Next steps:"
+echo "1. Update your Terraform .tf files to accept the new variables."
+echo "2. cd terraform && terraform apply"

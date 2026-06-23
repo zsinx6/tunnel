@@ -75,6 +75,12 @@ AllowedIPs   = 10.10.0.2/32
 PublicKey    = ${wg_tablet_public_key}
 PresharedKey = ${wg_tablet_psk}
 AllowedIPs   = 10.10.0.3/32
+
+[Peer]
+# Smartphone
+PublicKey    = ${wg_smartphone_public_key}
+PresharedKey = ${wg_smartphone_psk}
+AllowedIPs   = 10.10.0.4/32
 EOM
 
 chmod 600 /etc/wireguard/wg0.conf
@@ -97,12 +103,12 @@ EOM
 systemctl enable fail2ban
 systemctl restart fail2ban
 
-sed -i 's/^#\?Port.*/Port 50022/'                               /etc/ssh/sshd_config
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'           /etc/ssh/sshd_config
+sed -i 's/^#\?Port.*/Port 50022/'                                  /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'               /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'               /etc/ssh/sshd_config
-sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/'    /etc/ssh/sshd_config
+sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'                   /etc/ssh/sshd_config
+sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/'     /etc/ssh/sshd_config
 echo "AllowUsers $${NEW_USER}" >> /etc/ssh/sshd_config
 echo "MaxAuthTries 3"          >> /etc/ssh/sshd_config
 echo "LoginGraceTime 30"       >> /etc/ssh/sshd_config

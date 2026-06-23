@@ -14,19 +14,30 @@ variable "wg_desktop_public_key" {
   type        = string
 }
 
-variable "wg_tablet_public_key" {
-  description = "WireGuard tablet peer public key"
-  type        = string
-}
-
 variable "wg_desktop_psk" {
   description = "WireGuard preshared key for the desktop peer (post-quantum symmetric layer)"
   type        = string
   sensitive   = true
 }
 
+variable "wg_tablet_public_key" {
+  description = "WireGuard tablet peer public key"
+  type        = string
+}
+
 variable "wg_tablet_psk" {
   description = "WireGuard preshared key for the tablet peer (post-quantum symmetric layer)"
+  type        = string
+  sensitive   = true
+}
+
+variable "wg_smartphone_public_key" {
+  description = "WireGuard smartphone peer public key"
+  type        = string
+}
+
+variable "wg_smartphone_psk" {
+  description = "WireGuard preshared key for the smartphone peer (post-quantum symmetric layer)"
   type        = string
   sensitive   = true
 }
