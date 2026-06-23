@@ -102,10 +102,7 @@ resource "aws_instance" "wg_server" {
   user_data = templatefile("${path.module}/init-ec2.sh.tftpl", {
     ssh_public_key        = var.ssh_public_key
     wg_server_private_key = var.wg_server_private_key
-    wg_desktop_public_key = var.wg_desktop_public_key
-    wg_tablet_public_key  = var.wg_tablet_public_key
-    wg_desktop_psk        = var.wg_desktop_psk
-    wg_tablet_psk         = var.wg_tablet_psk
+    wg_peers              = var.wg_peers
   })
 
   # Force instance replacement when user_data changes (e.g. key rotation),

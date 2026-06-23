@@ -3,12 +3,9 @@ set -euo pipefail
 
 # ==============================================================================
 # 01-bootstrap.sh
-# Prepares local keys, SSH alias, and Terraform variables. 
+# Prepares local dependencies, bastion SSH key, and server WireGuard key.
 # Safe to re-run (idempotent).
 # ==============================================================================
-
-# Define your clients here! Just add to this list to provision new devices.
-CLIENTS=("desktop" "tablet" "smartphone")
 
 echo "=== 1. Installing Local Dependencies ==="
 MISSING_PKGS=()
@@ -16,6 +13,7 @@ command -v wg      &>/dev/null || MISSING_PKGS+=(wireguard-tools)
 command -v aws     &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
 command -v qrencode &>/dev/null || MISSING_PKGS+=(qrencode)
 command -v terraform &>/dev/null || MISSING_PKGS+=(terraform)
+command -v jq      &>/dev/null || MISSING_PKGS+=(jq)
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing packages: ${MISSING_PKGS[*]}"
@@ -48,48 +46,26 @@ EOF
     echo "Added 'wg-bastion' alias to ~/.ssh/config."
 fi
 
-echo "=== 4. Generating WireGuard Cryptography ==="
+echo "=== 4. Generating Server WireGuard Cryptography ==="
 mkdir -p ~/wireguard-keys && chmod 700 ~/wireguard-keys && cd ~/wireguard-keys
 
-# Ensure secure file creation
 umask 077
-
-# Server Keys
 if [ ! -f "server.key" ]; then
-    wg genkey > server.key && wg pubkey < server.key > server.pub
-    echo "Server keys generated."
+    wg genkey > server.key  && wg pubkey < server.key  > server.pub
+    echo "Server WireGuard keys generated."
+else
+    echo "Server WireGuard keys already exist. Skipping."
 fi
 
-# Client Keys
-for client in "${CLIENTS[@]}"; do
-    if [ ! -f "${client}.key" ]; then
-        wg genkey > "${client}.key" && wg pubkey < "${client}.key" > "${client}.pub"
-        wg genpsk > "${client}.psk"
-        echo "Keys generated for new client: ${client}"
-    fi
-done
-
-echo "=== 5. Writing Terraform Variables ==="
+echo "=== 5. Writing Base Terraform Variables ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 TF_DIR="${SCRIPT_DIR}/../terraform"
 mkdir -p "${TF_DIR}"
 
 TFVARS="${TF_DIR}/terraform.tfvars"
-
-# Overwriting tfvars safely ensures new clients are injected
 cat <<EOF > "$TFVARS"
 ssh_public_key        = "$(cat ${SSH_KEY_PATH}.pub)"
 wg_server_private_key = "$(cat server.key)"
 EOF
-
-for client in "${CLIENTS[@]}"; do
-    echo "wg_${client}_public_key = \"$(cat ${client}.pub)\"" >> "$TFVARS"
-    echo "wg_${client}_psk        = \"$(cat ${client}.psk)\"" >> "$TFVARS"
-done
-
 chmod 600 "$TFVARS"
-echo "terraform.tfvars successfully updated with all current clients."
-
-echo "Bootstrap complete. Next steps:"
-echo "1. Update your Terraform .tf files to accept the new variables."
-echo "2. cd terraform && terraform apply"
+echo "terraform.tfvars written with base server configurations."
