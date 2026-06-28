@@ -101,14 +101,14 @@ else
 fi
 
 echo "=== 7. Writing Base Terraform Variables ==="
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-TF_DIR="${SCRIPT_DIR}/../terraform"
-mkdir -p "${TF_DIR}"
-
 TFVARS="${TF_DIR}/terraform.tfvars"
-cat <<EOF > "$TFVARS"
+if [ ! -f "${TFVARS}" ]; then
+    cat <<EOF > "$TFVARS"
 ssh_public_key        = "$(cat ${SSH_KEY_PATH}.pub)"
 wg_server_private_key = "$(cat server.key)"
 EOF
-chmod 600 "$TFVARS"
-echo "terraform.tfvars written with base server configurations."
+    chmod 600 "$TFVARS"
+    echo "terraform.tfvars written with base server configurations."
+else
+    echo "terraform.tfvars already exists. Skipping."
+fi
