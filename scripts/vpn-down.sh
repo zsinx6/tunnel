@@ -6,7 +6,8 @@ set -euo pipefail
 # Closes local tunnel and cleanly halts AWS compute.
 # ==============================================================================
 
-REGION="sa-east-1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 echo "Shutting down local WireGuard tunnel..."
 sudo systemctl stop wg-quick@wg0

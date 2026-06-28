@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# vpn-up.sh
-# Powers on EC2 and establishes the WireGuard tunnel.
-# Prerequisite: sshd 2FA (Google Authenticator + KbdInteractiveAuthentication)
-# must already be configured permanently on the desktop.
-# ==============================================================================
-
-REGION="sa-east-1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 echo "=== 1. Locating WireGuard Bastion on AWS ==="
 INSTANCE_ID=$(aws ec2 describe-instances \
@@ -23,10 +17,6 @@ if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
 fi
 
 echo "=== 2. Waking Cloud Infrastructure ==="
-# Handle all possible states before calling start-instances:
-#   stopping → wait for fully stopped, then start
-#   pending  → already starting, just wait for running
-#   running  → nothing to do, proceed to tunnel check
 INSTANCE_STATE=$(aws ec2 describe-instances \
     --region "$REGION" \
     --instance-ids "$INSTANCE_ID" \
@@ -63,12 +53,15 @@ case "$INSTANCE_STATE" in
         ;;
 esac
 
+if [ "$FRESHLY_STARTED" = true ]; then
+    echo "Waiting for EC2 status checks to pass..."
+    aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$REGION"
+fi
+
 echo "=== 3. Establishing Encrypted Tunnel ==="
 echo "Starting local WireGuard interface..."
 sudo systemctl start wg-quick@wg0
 
-# Only wait for the startup-update service if the EC2 just booted.
-# On a fresh start it may install updates and reboot, extending bring-up time.
 if [ "$FRESHLY_STARTED" = true ]; then
     echo "Allowing 15s for remote EC2 startup-update service to run..."
     sleep 15
@@ -76,7 +69,8 @@ fi
 
 echo "Polling remote interface..."
 MAX_WAIT=180; ELAPSED=0
-until ping -c 1 -W 1 10.10.0.1 > /dev/null 2>&1; do
+until sudo wg show wg0 > /dev/null 2>&1 && \
+      sudo wg show wg0 | grep -qE "latest handshake:[[:space:]]+[0-9]"; do
     echo -n "."
     sleep 2
     ELAPSED=$((ELAPSED + 2))

@@ -1,17 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# 02-configure-clients.sh
-# Retrieves live Terraform output and builds final client configurations.
-# Run this from the repository root after 'terraform apply'.
-# ==============================================================================
-
-# Define mobile devices that need QR codes
-MOBILE_CLIENTS=("tablet" "smartphone")
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+source "${SCRIPT_DIR}/config.sh"
+
 TF_DIR="${SCRIPT_DIR}/../terraform"
+PEERS_JSON="${TF_DIR}/peers.auto.tfvars.json"
+
+command -v jq &>/dev/null || { echo "Error: 'jq' is required. Run: sudo pacman -S jq"; exit 1; }
+
+if [ ! -f "${PEERS_JSON}" ]; then
+    echo "Error: ${PEERS_JSON} not found. Run 01-bootstrap.sh first."
+    exit 1
+fi
+
+if ! jq empty "${PEERS_JSON}" 2>/dev/null; then
+    echo "Error: ${PEERS_JSON} is not valid JSON."
+    exit 1
+fi
+
+if ! jq -e '.wg_peers.desktop' "${PEERS_JSON}" &>/dev/null; then
+    echo "Error: No 'desktop' entry found in ${PEERS_JSON}."
+    exit 1
+fi
+
+PEER_COUNT=$(jq -r '.wg_peers | keys | length' "${PEERS_JSON}")
+if [ "$PEER_COUNT" -eq 0 ]; then
+    echo "Error: No peers defined in ${PEERS_JSON}."
+    exit 1
+fi
 
 echo "Checking prerequisites..."
 [ -f ~/wireguard-keys/server.pub ] || { echo "Error: Missing server pubkey."; exit 1; }
@@ -32,7 +49,6 @@ fi
 echo "Detected physical interface: ${PHYS_IF}"
 
 echo "=== Configuring Desktop WireGuard (/etc/wireguard/wg0.conf) ==="
-# Desktop remains hardcoded here due to the specific iptables routing requirements
 if [ -f /etc/wireguard/wg0.conf ]; then
     read -r -p "WARNING: /etc/wireguard/wg0.conf already exists. Overwrite it? [y/N] " REPLY
     REPLY="${REPLY:-n}"
@@ -47,17 +63,33 @@ if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     fi
 
     sudo mkdir -p /etc/wireguard
+    
+    DESKTOP_IP=$(jq -r '.wg_peers.desktop.ip' "${PEERS_JSON}")
+    if [ -z "$DESKTOP_IP" ] || [ "$DESKTOP_IP" = "null" ]; then
+        echo "Error: Desktop IP not found in ${PEERS_JSON}."
+        exit 1
+    fi
+    
+    if [ ! -f ~/wireguard-keys/desktop.key ]; then
+        echo "Error: ~/wireguard-keys/desktop.key not found."
+        exit 1
+    fi
+    
+    DESKTOP_KEY=$(cat ~/wireguard-keys/desktop.key)
+    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
+    DESKTOP_PSK=$(cat ~/wireguard-keys/desktop.psk)
+    
     sudo bash -c "cat <<WGEOF > /etc/wireguard/wg0.conf
 [Interface]
-PrivateKey = $(cat ~/wireguard-keys/desktop.key)
-Address = 10.10.0.2/24
+PrivateKey = ${DESKTOP_KEY}
+Address = ${DESKTOP_IP}/24
 
 PostUp   = iptables -I FORWARD -i wg0 -o ${PHYS_IF} -j DROP
 PostDown = iptables -D FORWARD -i wg0 -o ${PHYS_IF} -j DROP
 
 [Peer]
-PublicKey    = $(cat ~/wireguard-keys/server.pub)
-PresharedKey = $(cat ~/wireguard-keys/desktop.psk)
+PublicKey    = ${SERVER_PUB}
+PresharedKey = ${DESKTOP_PSK}
 Endpoint     = ${EIP}:51920
 AllowedIPs   = 10.10.0.0/24
 PersistentKeepalive = 30
@@ -67,31 +99,49 @@ WGEOF"
 fi
 
 echo "=== Generating Mobile Configurations ==="
-# Base IP offset starts at 3 (so tablet=10.10.0.3, smartphone=10.10.0.4)
-IP_OFFSET=3
 
-for client in "${MOBILE_CLIENTS[@]}"; do
+MOBILE_CLIENTS=$(jq -r '.wg_peers | to_entries[] | select(.key != "desktop") | .key' "${PEERS_JSON}")
+
+if [ -z "$MOBILE_CLIENTS" ]; then
+    echo "No mobile clients found in ${PEERS_JSON}."
+    exit 0
+fi
+
+for client in $MOBILE_CLIENTS; do
+    CLIENT_IP=$(jq -r ".wg_peers.${client}.ip" "${PEERS_JSON}")
+    
+    if [ -z "$CLIENT_IP" ] || [ "$CLIENT_IP" = "null" ]; then
+        echo "Warning: No IP found for ${client} in ${PEERS_JSON}, skipping."
+        continue
+    fi
+    
+    if [ ! -f ~/wireguard-keys/${client}.key ]; then
+        echo "Warning: Key file for ${client} not found, skipping."
+        continue
+    fi
+    
     echo ""
     echo "--------------------------------------------------------"
     echo " Scan this QR code with your ${client^}'s WireGuard app:"
     echo "--------------------------------------------------------"
     echo ""
     
+    CLIENT_KEY=$(cat ~/wireguard-keys/${client}.key)
+    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
+    CLIENT_PSK=$(cat ~/wireguard-keys/${client}.psk)
+    
     qrencode -t ansiutf8 <<QREOF
 [Interface]
-PrivateKey = $(cat ~/wireguard-keys/${client}.key)
-Address = 10.10.0.${IP_OFFSET}/24
+PrivateKey = ${CLIENT_KEY}
+Address = ${CLIENT_IP}/24
 
 [Peer]
-PublicKey    = $(cat ~/wireguard-keys/server.pub)
-PresharedKey = $(cat ~/wireguard-keys/${client}.psk)
+PublicKey    = ${SERVER_PUB}
+PresharedKey = ${CLIENT_PSK}
 Endpoint     = ${EIP}:51920
 AllowedIPs   = 10.10.0.0/24
 PersistentKeepalive = 25
 QREOF
     
-    ((IP_OFFSET++))
-    
-    # Pause to allow you to scan before clearing the screen
     read -r -p "Press [Enter] to continue to the next device..."
 done

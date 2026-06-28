@@ -12,11 +12,10 @@ NEW_USER="operator"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y wireguard iptables ufw fail2ban python3-systemd
+apt-get install -y wireguard iptables ufw fail2ban python3-systemd awscli
 
-id "$${NEW_USER}" &>/dev/null || useradd -m -s /bin/bash -N "$${NEW_USER}"
-usermod -aG sudo "$${NEW_USER}"
-echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/wg, /usr/sbin/ufw, /usr/sbin/iptables, /usr/bin/apt-get, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"
+id "$${NEW_USER}" &>/dev/null || useradd -m -s /bin/bash "$${NEW_USER}"
+echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/bin/wg, /usr/sbin/ufw, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"
 chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
 
 mkdir -p "/home/$${NEW_USER}/.ssh"
@@ -51,9 +50,42 @@ ETH_IF=$(ip route list default | awk '{print $5}' | head -n 1)
 mkdir -p /etc/wireguard
 chmod 700 /etc/wireguard
 
+echo "Fetching WireGuard server key from SSM..."
+if ! WG_SERVER_KEY=$(aws ssm get-parameter \
+  --name "/wg-bastion/server-private-key" \
+  --region "${region}" \
+  --with-decryption \
+  --query "Parameter.Value" \
+  --output text 2>&1); then
+    echo "CRITICAL: Failed to fetch server key from SSM: $WG_SERVER_KEY"
+    echo "Check IAM role permissions and SSM parameter existence."
+    exit 1
+fi
+if [ -z "$WG_SERVER_KEY" ]; then
+    echo "CRITICAL: Server key from SSM is empty."
+    exit 1
+fi
+
+%{ for name, peer in wg_peers ~}
+echo "Fetching PSK for peer '${name}' from SSM..."
+if ! PEER_PSK_${replace(name, "-", "_")}=$(aws ssm get-parameter \
+  --name "/wg-bastion/peer-psk/${name}" \
+  --region "${region}" \
+  --with-decryption \
+  --query "Parameter.Value" \
+  --output text 2>&1); then
+    echo "CRITICAL: Failed to fetch PSK for peer '${name}': $${PEER_PSK_${replace(name, "-", "_")}}"
+    exit 1
+fi
+if [ -z "$${PEER_PSK_${replace(name, "-", "_")}}" ]; then
+    echo "CRITICAL: PSK for peer '${name}' from SSM is empty."
+    exit 1
+fi
+%{ endfor ~}
+
 cat <<EOM > /etc/wireguard/wg0.conf
 [Interface]
-PrivateKey = ${wg_server_private_key}
+PrivateKey = $${WG_SERVER_KEY}
 ListenPort = 51920
 Address = 10.10.0.1/24
 
@@ -64,8 +96,9 @@ PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING 
 [Peer]
 # ${name}
 PublicKey    = ${peer.public_key}
-PresharedKey = ${peer.psk}
+PresharedKey = $${PEER_PSK_${replace(name, "-", "_")}}
 AllowedIPs   = ${peer.ip}/32
+PersistentKeepalive = 25
 
 %{ endfor ~}
 EOM
@@ -112,9 +145,6 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-if [ -f /var/run/reboot-required ]; then
-    systemctl reboot
-fi
 EOF
 chmod +x /usr/local/bin/startup-update.sh
 
@@ -123,7 +153,6 @@ cat << 'EOF' > /etc/systemd/system/startup-update.service
 Description=Install security updates on boot
 After=network-online.target
 Wants=network-online.target
-Before=wg-quick@wg0.service
 
 [Service]
 Type=oneshot
@@ -135,3 +164,8 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable startup-update.service
+
+if [ -f /var/run/reboot-required ]; then
+    echo "Security updates require a reboot. Rebooting now..."
+    systemctl reboot
+fi

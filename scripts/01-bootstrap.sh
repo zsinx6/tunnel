@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# 01-bootstrap.sh
-# Prepares local dependencies, bastion SSH key, and server WireGuard key.
-# Safe to re-run (idempotent).
-# ==============================================================================
-
 echo "=== 1. Installing Local Dependencies ==="
 MISSING_PKGS=()
 command -v wg      &>/dev/null || MISSING_PKGS+=(wireguard-tools)
@@ -20,6 +14,12 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     sudo pacman -S --needed --noconfirm "${MISSING_PKGS[@]}"
 else
     echo "All dependencies already installed. Skipping."
+fi
+
+AWS_VERSION=$(aws --version 2>&1 | grep -oP 'aws-cli/\K[0-9]+' || echo "0")
+if [ "$AWS_VERSION" -lt 2 ]; then
+    echo "Error: AWS CLI v2 is required. Current version: $(aws --version 2>&1)"
+    exit 1
 fi
 
 echo "=== 2. Generating Dedicated SSH Key ==="
@@ -57,7 +57,50 @@ else
     echo "Server WireGuard keys already exist. Skipping."
 fi
 
-echo "=== 5. Writing Base Terraform Variables ==="
+echo "=== 5. Generating Default Peer Keys ==="
+DEFAULT_PEERS=("desktop" "tablet" "smartphone")
+for peer in "${DEFAULT_PEERS[@]}"; do
+    if [ ! -f "${peer}.key" ]; then
+        wg genkey > "${peer}.key" && wg pubkey < "${peer}.key" > "${peer}.pub"
+        wg genpsk > "${peer}.psk"
+        echo "Generated keys for ${peer}."
+    else
+        echo "Keys for ${peer} already exist. Skipping."
+    fi
+done
+
+echo "=== 6. Creating Initial Peers Configuration ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+TF_DIR="${SCRIPT_DIR}/../terraform"
+PEERS_JSON="${TF_DIR}/peers.auto.tfvars.json"
+
+if [ ! -f "${PEERS_JSON}" ]; then
+    if ! jq -n \
+      --arg desktop_pub "$(cat desktop.pub)" \
+      --arg desktop_psk "$(cat desktop.psk)" \
+      --arg tablet_pub "$(cat tablet.pub)" \
+      --arg tablet_psk "$(cat tablet.psk)" \
+      --arg smartphone_pub "$(cat smartphone.pub)" \
+      --arg smartphone_psk "$(cat smartphone.psk)" \
+      '{
+        "wg_peers": {
+          "desktop": {"public_key": $desktop_pub, "psk": $desktop_psk, "ip": "10.10.0.2"},
+          "tablet": {"public_key": $tablet_pub, "psk": $tablet_psk, "ip": "10.10.0.3"},
+          "smartphone": {"public_key": $smartphone_pub, "psk": $smartphone_psk, "ip": "10.10.0.4"}
+        }
+      }' > "${PEERS_JSON}.tmp"; then
+        echo "Error: Failed to create ${PEERS_JSON}. Check that all key files are valid."
+        rm -f "${PEERS_JSON}.tmp"
+        exit 1
+    fi
+    mv "${PEERS_JSON}.tmp" "${PEERS_JSON}"
+    chmod 600 "${PEERS_JSON}"
+    echo "peers.auto.tfvars.json created with default peers."
+else
+    echo "peers.auto.tfvars.json already exists. Skipping."
+fi
+
+echo "=== 7. Writing Base Terraform Variables ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 TF_DIR="${SCRIPT_DIR}/../terraform"
 mkdir -p "${TF_DIR}"

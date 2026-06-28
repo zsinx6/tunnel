@@ -9,7 +9,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "sa-east-1"
+  region = var.aws_region
 }
 
 resource "aws_vpc" "wg_vpc" {
@@ -25,7 +25,7 @@ resource "aws_internet_gateway" "wg_igw" {
 resource "aws_subnet" "wg_subnet" {
   vpc_id                  = aws_vpc.wg_vpc.id
   cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
   availability_zone       = "sa-east-1a"
 }
 
@@ -53,7 +53,7 @@ resource "aws_security_group" "wg_sg" {
     from_port   = 50022
     to_port     = 50022
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.ssh_allowed_cidrs
     description = "SSH emergency access"
   }
 
@@ -91,18 +91,76 @@ resource "aws_key_pair" "wg_key" {
   public_key = var.ssh_public_key
 }
 
+resource "aws_ssm_parameter" "wg_server_private_key" {
+  name        = "/wg-bastion/server-private-key"
+  description = "WireGuard server private key"
+  type        = "SecureString"
+  value       = var.wg_server_private_key
+  tags        = { Name = "wg-bastion-wg-key" }
+}
+
+resource "aws_ssm_parameter" "wg_peer_psk" {
+  for_each    = nonsensitive(var.wg_peers)
+  name        = "/wg-bastion/peer-psk/${each.key}"
+  description = "WireGuard PSK for peer ${each.key}"
+  type        = "SecureString"
+  value       = each.value.psk
+}
+
+resource "aws_iam_role" "wg_server_role" {
+  name = "wg-bastion-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "wg_server_ssm" {
+  name = "wg-bastion-ssm-access"
+  role = aws_iam_role.wg_server_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["ssm:GetParameter"]
+      Resource = concat(
+        [aws_ssm_parameter.wg_server_private_key.arn],
+        [for p in aws_ssm_parameter.wg_peer_psk : p.arn]
+      )
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "wg_server_profile" {
+  name = "wg-bastion-profile"
+  role = aws_iam_role.wg_server_role.name
+}
+
 resource "aws_instance" "wg_server" {
   ami                    = data.aws_ami.debian.id
   instance_type          = "t3.nano"
   subnet_id              = aws_subnet.wg_subnet.id
   vpc_security_group_ids = [aws_security_group.wg_sg.id]
   key_name               = aws_key_pair.wg_key.key_name
+  iam_instance_profile   = aws_iam_instance_profile.wg_server_profile.name
   tags                   = { Name = "wg-bastion" }
+
+  credit_specification {
+    cpu_credits = "standard"
+  }
+
+  disable_api_termination = true
 
   user_data = templatefile("${path.module}/init-ec2.sh.tftpl", {
     ssh_public_key        = var.ssh_public_key
-    wg_server_private_key = var.wg_server_private_key
     wg_peers              = var.wg_peers
+    region                = var.aws_region
   })
 
   # Force instance replacement when user_data changes (e.g. key rotation),
@@ -119,6 +177,53 @@ resource "aws_instance" "wg_server" {
     http_tokens                 = "required"
     http_put_response_hop_limit = 1
   }
+}
+
+resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
+  name              = "/aws/vpc/flow-logs/wg-vpc"
+  retention_in_days = 30
+}
+
+resource "aws_flow_log" "vpc_flow_log" {
+  iam_role_arn    = aws_iam_role.flow_log_role.arn
+  log_destination = aws_cloudwatch_log_group.vpc_flow_logs.arn
+  traffic_type    = "ALL"
+  vpc_id          = aws_vpc.wg_vpc.id
+}
+
+resource "aws_iam_role" "flow_log_role" {
+  name = "vpc-flow-log-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "vpc-flow-logs.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "flow_log_policy" {
+  name = "vpc-flow-log-policy"
+  role = aws_iam_role.flow_log_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Resource = "*"
+    }]
+  })
 }
 
 resource "aws_eip" "wg_eip" {
