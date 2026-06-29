@@ -25,7 +25,7 @@ resource "aws_internet_gateway" "wg_igw" {
 resource "aws_subnet" "wg_subnet" {
   vpc_id                  = aws_vpc.wg_vpc.id
   cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = false
+  map_public_ip_on_launch = true
   availability_zone       = "sa-east-1a"
 }
 
@@ -151,16 +151,22 @@ resource "aws_instance" "wg_server" {
   iam_instance_profile   = aws_iam_instance_profile.wg_server_profile.name
   tags                   = { Name = "wg-bastion" }
 
+  # The instance fetches its WireGuard secrets from SSM at boot via its IAM role,
+  # so the parameters and the policy granting access must exist before it launches.
+  depends_on = [
+    aws_iam_role_policy.wg_server_ssm,
+    aws_ssm_parameter.wg_server_private_key,
+    aws_ssm_parameter.wg_peer_psk,
+  ]
+
   credit_specification {
     cpu_credits = "standard"
   }
 
-  disable_api_termination = true
-
   user_data = templatefile("${path.module}/init-ec2.sh.tftpl", {
-    ssh_public_key        = var.ssh_public_key
-    wg_peers              = var.wg_peers
-    region                = var.aws_region
+    ssh_public_key = var.ssh_public_key
+    wg_peers       = var.wg_peers
+    region         = var.aws_region
   })
 
   # Force instance replacement when user_data changes (e.g. key rotation),

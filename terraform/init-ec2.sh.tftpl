@@ -7,22 +7,50 @@ set -euo pipefail
 # and a boot-time security update service.
 # ==============================================================================
 
-NEW_USER="operator"
+NEW_USER="wgadmin"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y wireguard iptables ufw fail2ban python3-systemd awscli
+apt-get install -y wireguard iptables ufw fail2ban python3-systemd curl unzip
 
-id "$${NEW_USER}" &>/dev/null || useradd -m -s /bin/bash "$${NEW_USER}"
+echo "Installing AWS CLI v2..."
+cd /tmp
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+cd /
+rm -rf /tmp/aws /tmp/awscliv2.zip
+
+if id "$${NEW_USER}" &>/dev/null; then
+    echo "User $${NEW_USER} already exists."
+else
+    if getent group "$${NEW_USER}" &>/dev/null; then
+        useradd -m -s /bin/bash -g "$${NEW_USER}" "$${NEW_USER}" || { echo "ERROR: useradd failed"; exit 1; }
+    else
+        useradd -m -s /bin/bash "$${NEW_USER}" || { echo "ERROR: useradd failed"; exit 1; }
+    fi
+    echo "User $${NEW_USER} created."
+fi
+
+echo "Setting up sudo for $${NEW_USER}..."
 echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/bin/wg, /usr/sbin/ufw, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"
 chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
+echo "Sudo configured for $${NEW_USER}."
 
-mkdir -p "/home/$${NEW_USER}/.ssh"
-echo "${ssh_public_key}" > "/home/$${NEW_USER}/.ssh/authorized_keys"
-chown -R "$${NEW_USER}:$${NEW_USER}" "/home/$${NEW_USER}/.ssh"
-chmod 700 "/home/$${NEW_USER}/.ssh"
-chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys"
+echo "Setting up SSH for $${NEW_USER}..."
+mkdir -p "/home/$${NEW_USER}/.ssh" || { echo "ERROR: mkdir failed"; exit 1; }
+echo "${ssh_public_key}" > "/home/$${NEW_USER}/.ssh/authorized_keys" || { echo "ERROR: echo failed"; exit 1; }
+chown -R "$${NEW_USER}:$${NEW_USER}" "/home/$${NEW_USER}/.ssh" || { echo "ERROR: chown failed"; exit 1; }
+chmod 700 "/home/$${NEW_USER}/.ssh" || { echo "ERROR: chmod .ssh failed"; exit 1; }
+chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys" || { echo "ERROR: chmod authorized_keys failed"; exit 1; }
+chmod 755 "/home/$${NEW_USER}" || { echo "ERROR: chmod home failed"; exit 1; }
+
+echo "Verifying SSH setup..."
+ls -la "/home/$${NEW_USER}/.ssh/"
+cat "/home/$${NEW_USER}/.ssh/authorized_keys"
+stat -c "%U:%G %a %n" "/home/$${NEW_USER}" "/home/$${NEW_USER}/.ssh" "/home/$${NEW_USER}/.ssh/authorized_keys"
+echo "SSH key installed for $${NEW_USER}."
 
 cat <<EOM > /etc/sysctl.d/99-security-routing.conf
 net.ipv4.ip_forward=1
@@ -51,34 +79,42 @@ mkdir -p /etc/wireguard
 chmod 700 /etc/wireguard
 
 echo "Fetching WireGuard server key from SSM..."
-if ! WG_SERVER_KEY=$(aws ssm get-parameter \
-  --name "/wg-bastion/server-private-key" \
-  --region "${region}" \
-  --with-decryption \
-  --query "Parameter.Value" \
-  --output text 2>&1); then
-    echo "CRITICAL: Failed to fetch server key from SSM: $WG_SERVER_KEY"
-    echo "Check IAM role permissions and SSM parameter existence."
-    exit 1
-fi
+for i in 1 2 3 4 5; do
+    if WG_SERVER_KEY=$(aws ssm get-parameter \
+      --name "/wg-bastion/server-private-key" \
+      --region "${region}" \
+      --with-decryption \
+      --query "Parameter.Value" \
+      --output text 2>/dev/null); then
+        break
+    fi
+    echo "SSM fetch attempt $i failed, waiting 10s for IAM propagation..."
+    sleep 10
+done
+
 if [ -z "$WG_SERVER_KEY" ]; then
-    echo "CRITICAL: Server key from SSM is empty."
+    echo "CRITICAL: Failed to fetch server key from SSM after 5 attempts."
+    echo "Check IAM role permissions and SSM parameter existence."
     exit 1
 fi
 
 %{ for name, peer in wg_peers ~}
 echo "Fetching PSK for peer '${name}' from SSM..."
-if ! PEER_PSK_${replace(name, "-", "_")}=$(aws ssm get-parameter \
-  --name "/wg-bastion/peer-psk/${name}" \
-  --region "${region}" \
-  --with-decryption \
-  --query "Parameter.Value" \
-  --output text 2>&1); then
-    echo "CRITICAL: Failed to fetch PSK for peer '${name}': $${PEER_PSK_${replace(name, "-", "_")}}"
-    exit 1
-fi
+for i in 1 2 3 4 5; do
+    if PEER_PSK_${replace(name, "-", "_")}=$(aws ssm get-parameter \
+      --name "/wg-bastion/peer-psk/${name}" \
+      --region "${region}" \
+      --with-decryption \
+      --query "Parameter.Value" \
+      --output text 2>/dev/null); then
+        break
+    fi
+    echo "SSM fetch attempt $i for ${name} failed, waiting 10s..."
+    sleep 10
+done
+
 if [ -z "$${PEER_PSK_${replace(name, "-", "_")}}" ]; then
-    echo "CRITICAL: PSK for peer '${name}' from SSM is empty."
+    echo "CRITICAL: Failed to fetch PSK for peer '${name}' after 5 attempts."
     exit 1
 fi
 %{ endfor ~}
@@ -137,7 +173,18 @@ if ! sshd -t; then
     echo "CRITICAL: sshd_config has a syntax error — check /etc/ssh/sshd_config and fix before rebooting."
     exit 1
 fi
+# On socket-activated sshd (Debian 13+/Ubuntu) the listening port comes from
+# ssh.socket, not sshd_config, so the Port directive above would be ignored and
+# the only allowed SG port (50022) would never be served. Debian 12 uses the
+# classic always-on service, so this block is a no-op there.
+if systemctl is-enabled ssh.socket &>/dev/null; then
+    systemctl disable --now ssh.socket
+    systemctl enable ssh.service
+fi
+
+echo "SSH configuration validated. Restarting SSH..."
 systemctl restart ssh
+echo "SSH restarted successfully."
 
 cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
