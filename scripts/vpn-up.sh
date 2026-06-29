@@ -79,7 +79,7 @@ until sudo wg show wg0 > /dev/null 2>&1 && \
         EIP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
             --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null || echo "<EIP>")
         echo "Error: Tunnel did not come up within ${MAX_WAIT}s."
-        echo "SSH directly to check logs: ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 operator@${EIP}"
+        echo "SSH directly to check logs: ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 wgadmin@${EIP}"
         echo "Then run: journalctl -u wg-quick@wg0 -u startup-update"
         exit 1
     fi

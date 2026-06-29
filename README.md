@@ -211,7 +211,7 @@ If WireGuard fails to come up, SSH directly to the EC2 using the public Elastic 
 # Get the EIP
 terraform -chdir=terraform output wg_elastic_ip
 
-ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 operator@<EIP>
+ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 wgadmin@<EIP>
 
 # Diagnose on the instance
 journalctl -u wg-quick@wg0

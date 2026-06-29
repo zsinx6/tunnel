@@ -39,7 +39,7 @@ cat <<EOF >> ~/.ssh/config
 
 Host wg-bastion
     HostName 10.10.0.1
-    User operator
+    User wgadmin
     Port 50022
     IdentityFile ${SSH_KEY_PATH}
 EOF
