@@ -16,7 +16,7 @@ apt-get install -y wireguard iptables ufw fail2ban python3-systemd curl unzip
 
 echo "Installing AWS CLI v2..."
 cd /tmp
-curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip -q awscliv2.zip
 ./aws/install
 cd /
@@ -173,10 +173,18 @@ if ! sshd -t; then
     echo "CRITICAL: sshd_config has a syntax error — check /etc/ssh/sshd_config and fix before rebooting."
     exit 1
 fi
+# On socket-activated sshd (Debian 13+/Ubuntu) the listening port comes from
+# ssh.socket, not sshd_config, so the Port directive above would be ignored and
+# the only allowed SG port (50022) would never be served. Debian 12 uses the
+# classic always-on service, so this block is a no-op there.
+if systemctl is-enabled ssh.socket &>/dev/null; then
+    systemctl disable --now ssh.socket
+    systemctl enable ssh.service
+fi
+
 echo "SSH configuration validated. Restarting SSH..."
 systemctl restart ssh
 echo "SSH restarted successfully."
-systemctl restart ssh
 
 cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
