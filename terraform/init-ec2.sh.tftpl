@@ -12,11 +12,19 @@ NEW_USER="wgadmin"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y wireguard iptables ufw fail2ban python3-systemd curl unzip
+apt-get install -y wireguard iptables ufw fail2ban python3-systemd curl unzip unattended-upgrades
+echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
+dpkg-reconfigure -f noninteractive unattended-upgrades
 
 echo "Installing AWS CLI v2..."
 cd /tmp
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+EXPECTED_SHA256=$(curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sha256")
+ACTUAL_SHA256=$(sha256sum awscliv2.zip | awk '{print $1}')
+if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+    echo "ERROR: AWS CLI checksum verification failed!"
+    exit 1
+fi
 unzip -q awscliv2.zip
 ./aws/install
 cd /
@@ -46,10 +54,6 @@ chmod 700 "/home/$${NEW_USER}/.ssh" || { echo "ERROR: chmod .ssh failed"; exit 1
 chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys" || { echo "ERROR: chmod authorized_keys failed"; exit 1; }
 chmod 755 "/home/$${NEW_USER}" || { echo "ERROR: chmod home failed"; exit 1; }
 
-echo "Verifying SSH setup..."
-ls -la "/home/$${NEW_USER}/.ssh/"
-cat "/home/$${NEW_USER}/.ssh/authorized_keys"
-stat -c "%U:%G %a %n" "/home/$${NEW_USER}" "/home/$${NEW_USER}/.ssh" "/home/$${NEW_USER}/.ssh/authorized_keys"
 echo "SSH key installed for $${NEW_USER}."
 
 cat <<EOM > /etc/sysctl.d/99-security-routing.conf
@@ -190,8 +194,7 @@ cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+unattended-upgrades
 EOF
 chmod +x /usr/local/bin/startup-update.sh
 
