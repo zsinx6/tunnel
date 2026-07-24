@@ -275,6 +275,14 @@ Mobile/tablet: the old WireGuard tunnels are dead — delete those WireGuard app
 shred -u terraform/terraform.tfstate.backup
 ```
 
+**Lost the state file?** If the old deployment's `terraform.tfstate` is gone but the infra was never hand-modified, run:
+
+```bash
+bash scripts/destroy-old-main-infra.sh
+```
+
+It rebuilds the state with `terraform import` against a throwaway git worktree of `main` (nothing drifted, so imports are exact), then runs `terraform destroy` — you review the plan and confirm. Afterwards deploy fresh: `01-bootstrap.sh` → `terraform apply` → DNS → `02-configure-clients.sh`. A new Elastic IP is allocated, which is harmless as long as the DNS record hasn't been created yet.
+
 ---
 
 ## Re-provisioning Caveats
@@ -332,6 +340,7 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 │   ├── 02-configure-clients.sh    # Register the desktop with Headscale
 │   ├── add-device.sh              # Generate one-time auth keys for new devices
 │   ├── migrate-from-main.sh       # One-time migration from the WireGuard design
+│   ├── destroy-old-main-infra.sh  # Lost-state recovery: import + destroy the old design
 │   ├── vpn-up.sh                  # Start EC2 + Tailscale
 │   └── vpn-down.sh                # Stop Tailscale + EC2 (verifies the stop)
 ├── terraform/
