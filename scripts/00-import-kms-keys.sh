@@ -15,14 +15,26 @@ KEY_ID_STATE="${KMS_MATERIAL_DIR}/ebs_key_id"
 TMP_IMPORT_DIR=""
 trap '[ -n "${TMP_IMPORT_DIR}" ] && rm -rf "${TMP_IMPORT_DIR}"' EXIT
 
-if [ -f "${KMS_KEYS_FILE}" ]; then
-    echo "KMS keys already configured at ${KMS_KEYS_FILE}. Skipping."
-    exit 0
-fi
-
 for cmd in openssl aws jq; do
     command -v "$cmd" &>/dev/null || { echo "Error: '$cmd' is required."; exit 1; }
 done
+
+if [ -f "${KMS_KEYS_FILE}" ]; then
+    # The key must be recorded as a full ARN: EC2 canonicalizes the value to an
+    # ARN in Terraform state, so a bare key ID causes a perpetual
+    # "forces replacement" diff on the instance.
+    EXISTING=$(jq -r '.kms_ebs_key_id // empty' "${KMS_KEYS_FILE}")
+    if [ -n "${EXISTING}" ] && [[ "${EXISTING}" != arn:* ]]; then
+        ARN=$(aws kms describe-key --key-id "${EXISTING}" --region "$REGION" \
+            --query "KeyMetadata.Arn" --output text)
+        jq -n --arg ebs "$ARN" '{kms_ebs_key_id: $ebs}' > "${KMS_KEYS_FILE}"
+        chmod 600 "${KMS_KEYS_FILE}"
+        echo "Upgraded ${KMS_KEYS_FILE} to use the key ARN (${ARN})."
+    else
+        echo "KMS keys already configured at ${KMS_KEYS_FILE}. Skipping."
+    fi
+    exit 0
+fi
 
 echo "=== 1. Generating local key material ==="
 umask 077
@@ -41,14 +53,20 @@ fi
 echo "=== 2. Creating KMS key (EXTERNAL origin) ==="
 if [ -f "${KEY_ID_STATE}" ]; then
     EBS_KEY_ID=$(cat "${KEY_ID_STATE}")
+    if [[ "${EBS_KEY_ID}" != arn:* ]]; then
+        EBS_KEY_ID=$(aws kms describe-key --key-id "${EBS_KEY_ID}" --region "$REGION" \
+            --query "KeyMetadata.Arn" --output text)
+        echo "$EBS_KEY_ID" > "${KEY_ID_STATE}"
+    fi
     echo "Reusing previously created KMS key: ${EBS_KEY_ID}"
 else
+    # Record the ARN (not the bare key ID) — see the note at the top.
     EBS_KEY_ID=$(aws kms create-key \
         --region "$REGION" \
         --origin EXTERNAL \
         --description "wg-bastion EBS BYOK" \
         --tags TagKey=Name,TagValue=wg-bastion-ebs \
-        --query "KeyMetadata.KeyId" \
+        --query "KeyMetadata.Arn" \
         --output text)
     echo "$EBS_KEY_ID" > "${KEY_ID_STATE}"
     echo "Created EBS KMS key: ${EBS_KEY_ID}"

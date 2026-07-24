@@ -69,8 +69,14 @@ prompt_domain() {
     echo "(the exact record is printed by: terraform output dns_setup)."
     echo ""
     read -r -p "Headscale domain: " HEADSCALE_DOMAIN
-    if [ -z "${HEADSCALE_DOMAIN}" ]; then
-        echo "Error: a domain is required — Caddy uses it for the Let's Encrypt certificate."
+    # Normalize common paste mistakes, then mirror the Terraform validation
+    # so bad input fails here instead of at 'terraform apply'.
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN,,}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN#https://}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN%/}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN%.}"
+    if ! [[ "${HEADSCALE_DOMAIN}" =~ ^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$ ]]; then
+        echo "Error: '${HEADSCALE_DOMAIN}' is not a valid DNS name (expected e.g. hs.zsinx6.dev)."
         exit 1
     fi
 }
@@ -85,12 +91,33 @@ headscale_domain = "${HEADSCALE_DOMAIN}"
 EOF
     chmod 600 "$TFVARS"
     echo "terraform.tfvars written."
-elif ! grep -q '^headscale_domain' "${TFVARS}"; then
-    prompt_domain
-    printf 'headscale_domain = "%s"\n' "${HEADSCALE_DOMAIN}" >> "${TFVARS}"
-    echo "headscale_domain added to terraform.tfvars."
 else
-    echo "terraform.tfvars already exists. Skipping."
+    # Existing tfvars (possibly from an older deployment): ensure every
+    # variable this branch requires is present, without clobbering the rest.
+    UPDATED=false
+    if ! grep -q '^kms_ebs_key_id' "${TFVARS}"; then
+        printf 'kms_ebs_key_id   = "%s"\n' "${EBS_KEY_ID}" >> "${TFVARS}"
+        echo "kms_ebs_key_id added to terraform.tfvars."
+        UPDATED=true
+    fi
+    if ! grep -q '^headscale_domain' "${TFVARS}"; then
+        prompt_domain
+        printf 'headscale_domain = "%s"\n' "${HEADSCALE_DOMAIN}" >> "${TFVARS}"
+        echo "headscale_domain added to terraform.tfvars."
+        UPDATED=true
+    fi
+    chmod 600 "$TFVARS"
+    if grep -qE '^(wg_server_private_key|wg_peers)' "${TFVARS}"; then
+        echo ""
+        echo "WARNING: terraform.tfvars still contains WireGuard-era entries"
+        echo "(wg_server_private_key and/or wg_peers) from the old design. They"
+        echo "keep a private key on disk and cause Terraform warnings."
+        echo "Run the migration helper to retire them safely:"
+        echo "  bash scripts/migrate-from-main.sh"
+    fi
+    if [ "$UPDATED" = false ]; then
+        echo "terraform.tfvars already up to date. Skipping."
+    fi
 fi
 
 echo ""

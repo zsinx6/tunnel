@@ -18,6 +18,11 @@ HEADSCALE_URL=$(terraform -chdir="${TF_DIR}" output -raw headscale_url 2>/dev/nu
 }
 DOMAIN="${HEADSCALE_URL#https://}"
 
+if ! command -v tailscale &>/dev/null; then
+    echo "Error: Tailscale client not installed. Run 01-bootstrap.sh first."
+    exit 1
+fi
+
 echo "=== Checking DNS ==="
 RESOLVED=$(getent ahostsv4 "${DOMAIN}" 2>/dev/null | awk '{print $1; exit}' || true)
 if [ -z "${RESOLVED}" ]; then
@@ -40,15 +45,21 @@ elif [ "${RESOLVED}" != "${EIP}" ]; then
 fi
 
 echo "=== Ensuring EC2 is running ==="
-INSTANCE_ID=$(aws ec2 describe-instances \
+INSTANCE_IDS=$(aws ec2 describe-instances \
     --region "$REGION" \
     --filters "Name=tag:Name,Values=${INSTANCE_TAG}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-    --query "Reservations[0].Instances[0].InstanceId" \
+    --query "Reservations[].Instances[].InstanceId" \
     --output text)
-if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+COUNT=$(wc -w <<< "${INSTANCE_IDS}")
+if [ "$COUNT" -eq 0 ]; then
     echo "Error: Could not find an instance tagged '${INSTANCE_TAG}'."
     exit 1
+elif [ "$COUNT" -gt 1 ]; then
+    echo "Error: found ${COUNT} instances tagged '${INSTANCE_TAG}': ${INSTANCE_IDS}"
+    echo "Refusing to guess. Clean up the duplicates first."
+    exit 1
 fi
+INSTANCE_ID="${INSTANCE_IDS}"
 
 INSTANCE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
     --query "Reservations[0].Instances[0].State.Name" --output text)
@@ -127,7 +138,16 @@ if [ -z "${USER_ID}" ]; then
         exit 1
     }
     USER_ID=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
-        "sudo headscale users list --output json" | jq -r '.[] | select(.name == "default") | .id')
+        "sudo headscale users list --output json" 2>"${SSH_ERR}" \
+        | jq -r '.[] | select(.name == "default") | .id // empty') || {
+        echo "Error: could not list Headscale users after creating 'default':"
+        cat "${SSH_ERR}"
+        exit 1
+    }
+    if [ -z "${USER_ID}" ]; then
+        echo "Error: Headscale user 'default' still not found after creation."
+        exit 1
+    fi
 fi
 
 # One-time, short-lived key: harmless in shell history / process listings

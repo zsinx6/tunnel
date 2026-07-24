@@ -16,8 +16,13 @@ variable "aws_region" {
 }
 
 variable "kms_ebs_key_id" {
-  description = "KMS key ID for EBS volume encryption (BYOK)"
+  description = "KMS key ARN for EBS volume encryption (BYOK). Must be the full ARN: EC2 canonicalizes the value to an ARN in state, so a bare key ID causes a perpetual forces-replacement diff on the instance."
   type        = string
+
+  validation {
+    condition     = startswith(var.kms_ebs_key_id, "arn:")
+    error_message = "kms_ebs_key_id must be the full key ARN (arn:aws:kms:...). Re-run scripts/00-import-kms-keys.sh — it upgrades an existing kms_keys.auto.tfvars.json in place."
+  }
 }
 
 variable "headscale_domain" {

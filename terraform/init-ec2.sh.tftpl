@@ -255,12 +255,22 @@ cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-unattended-upgrades
+# Tolerate apt lock contention with the apt-daily timers at boot; a skipped
+# update pass is better than a failed unit.
+apt-get -o DPkg::Lock::Timeout=120 update -qq
+unattended-upgrades || echo "unattended-upgrades failed (apt lock contention?); skipping this boot"
 latest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
 if [ -n "$${latest_kernel}" ] && [ "$(uname -r)" != "$${latest_kernel}" ]; then
-    echo "New kernel $${latest_kernel} installed (running $(uname -r)). Rebooting..."
-    systemctl reboot
+    # Reboot at most once per target kernel: if GRUB keeps booting an older
+    # kernel (e.g. failed-kernel fallback), do not reboot-loop the relay.
+    marker=/var/lib/startup-update.reboot-attempted
+    if [ -f "$${marker}" ] && [ "$(cat "$${marker}")" = "$${latest_kernel}" ]; then
+        echo "Already attempted reboot into $${latest_kernel}, still running $(uname -r). Not rebooting again."
+    else
+        echo "New kernel $${latest_kernel} installed (running $(uname -r)). Rebooting..."
+        echo "$${latest_kernel}" > "$${marker}"
+        systemctl reboot
+    fi
 fi
 EOF
 chmod +x /usr/local/bin/startup-update.sh
