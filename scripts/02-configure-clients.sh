@@ -5,109 +5,176 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 TF_DIR="${SCRIPT_DIR}/../terraform"
+SSH_OPTS=(-i "${SSH_KEY}" -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
-echo "Fetching Elastic IP from Terraform..."
-EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip)
-
-if [ -z "$EIP" ] || [[ "$EIP" == *"No outputs found"* ]]; then
-    echo "Error: Could not retrieve Elastic IP. Did 'terraform apply' succeed?"
+echo "Fetching Terraform outputs..."
+EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip 2>/dev/null) || {
+    echo "Error: could not read wg_elastic_ip output. Did 'terraform apply' succeed?"
     exit 1
-fi
+}
+HEADSCALE_URL=$(terraform -chdir="${TF_DIR}" output -raw headscale_url 2>/dev/null) || {
+    echo "Error: could not read headscale_url output. Did 'terraform apply' succeed?"
+    exit 1
+}
+DOMAIN="${HEADSCALE_URL#https://}"
 
-HEADSCALE_URL="https://${EIP}:443"
+echo "=== Checking DNS ==="
+RESOLVED=$(getent ahostsv4 "${DOMAIN}" 2>/dev/null | awk '{print $1; exit}' || true)
+if [ -z "${RESOLVED}" ]; then
+    echo "Error: ${DOMAIN} does not resolve yet."
+    echo ""
+    echo "One-time setup — in your registrar's DNS panel, create this record:"
+    echo "  Type:  A"
+    echo "  Name:  ${DOMAIN}   (some panels want only the subdomain part, e.g. '${DOMAIN%%.*}')"
+    echo "  Value: ${EIP}"
+    echo "  TTL:   300 (or the panel's default)"
+    echo ""
+    echo "Wait 1-5 minutes for propagation, verify with:"
+    echo "  dig +short ${DOMAIN}    # must print ${EIP}"
+    echo "then re-run this script."
+    echo "(Alternatively: host DNS in Route53 and set route53_zone_id in terraform.tfvars.)"
+    exit 1
+elif [ "${RESOLVED}" != "${EIP}" ]; then
+    echo "Warning: ${DOMAIN} resolves to ${RESOLVED}, expected ${EIP}."
+    echo "If you just updated DNS this may be caching; TLS will fail until it matches."
+fi
 
 echo "=== Ensuring EC2 is running ==="
 INSTANCE_ID=$(aws ec2 describe-instances \
     --region "$REGION" \
-    --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=running" \
+    --filters "Name=tag:Name,Values=${INSTANCE_TAG}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
     --query "Reservations[0].Instances[0].InstanceId" \
     --output text)
-
 if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
-    echo "EC2 is not running. Starting it..."
-    INSTANCE_ID=$(aws ec2 describe-instances \
-        --region "$REGION" \
-        --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=stopped" \
-        --query "Reservations[0].Instances[0].InstanceId" \
-        --output text)
-    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
-        echo "Error: Could not find a stopped bastion instance."
+    echo "Error: Could not find an instance tagged '${INSTANCE_TAG}'."
+    exit 1
+fi
+
+INSTANCE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query "Reservations[0].Instances[0].State.Name" --output text)
+case "$INSTANCE_STATE" in
+    running) ;;
+    pending)
+        echo "Instance is starting. Waiting..."
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    stopping)
+        echo "Instance is stopping. Waiting for it to stop, then restarting..."
+        aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" --region "$REGION"
+        aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    stopped)
+        echo "Starting EC2 instance..."
+        aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    *)
+        echo "Error: instance in unexpected state '${INSTANCE_STATE}'."
+        exit 1
+        ;;
+esac
+
+echo "=== Waiting for Headscale (with valid TLS) ==="
+MAX_WAIT=300; ELAPSED=0
+until curl -fsS --max-time 5 "${HEADSCALE_URL}/health" > /dev/null 2>&1; do
+    echo -n "."
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+        echo ""
+        echo "Error: ${HEADSCALE_URL}/health not ready within ${MAX_WAIT}s."
+        echo "On first boot this can mean the Let's Encrypt certificate is not"
+        echo "issued yet (DNS must point at ${EIP}). Diagnose with:"
+        echo "  ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} sudo tunnel-logs"
         exit 1
     fi
-    aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
-    aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
-    aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$REGION"
-    echo "EC2 is running. Waiting for Headscale..."
-    MAX_WAIT=120; ELAPSED=0
-    until curl -fsSL -k --max-time 5 "${HEADSCALE_URL}" > /dev/null 2>&1; do
-        echo -n "."
-        sleep 2
-        ELAPSED=$((ELAPSED + 2))
-        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-            echo ""
-            echo "Error: Headscale did not become ready within ${MAX_WAIT}s."
-            exit 1
-        fi
-    done
-    echo ""
-fi
+done
+echo ""
+echo "Headscale is ready at ${HEADSCALE_URL}"
 
-echo "=== Downloading CA certificate ==="
-CA_CERT="/tmp/headscale-ca.crt"
-scp -i ~/.ssh/wg_ec2_ed25519 -P 50022 -o StrictHostKeyChecking=accept-new \
-    wgadmin@"${EIP}":/etc/headscale/ca.crt "${CA_CERT}" 2>/dev/null
-
-if [ ! -f "${CA_CERT}" ]; then
-    echo "Error: Could not download CA certificate from EC2."
+echo "=== Checking existing registration ==="
+if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; then
+    CONTROL_URL=$(tailscale debug prefs 2>/dev/null | jq -r '.ControlURL // empty' || true)
+    if [ "${CONTROL_URL%/}" = "${HEADSCALE_URL%/}" ]; then
+        echo "Desktop is already registered with ${HEADSCALE_URL} and online."
+        exit 0
+    fi
+    echo "Warning: this machine is online against a DIFFERENT control server:"
+    echo "  ${CONTROL_URL:-unknown}"
+    echo "Refusing to switch it silently. To move it to ${HEADSCALE_URL}, run:"
+    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --accept-routes --force-reauth"
     exit 1
 fi
 
-echo "=== Installing CA certificate into system trust store ==="
-sudo cp "${CA_CERT}" /etc/ca-certificates/trust-source/anchors/headscale-ca.crt 2>/dev/null \
-    || sudo cp "${CA_CERT}" /usr/local/share/ca-certificates/headscale-ca.crt
-sudo update-ca-certificates 2>/dev/null || sudo update-ca-trust 2>/dev/null || true
-rm -f "${CA_CERT}"
-echo "CA certificate installed."
+echo "=== Generating one-time auth key ==="
+SSH_ERR=$(mktemp)
+trap 'rm -f "${SSH_ERR}"' EXIT
 
-echo "=== Generating auth key ==="
-AUTH_KEY=$(ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 -o StrictHostKeyChecking=accept-new wgadmin@"${EIP}" \
-    "sudo headscale preauthkeys create --user default --reusable" 2>/dev/null || echo "")
-
-if [ -z "$AUTH_KEY" ]; then
-    echo "Error: Failed to generate auth key."
+USERS_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale users list --output json" 2>"${SSH_ERR}") || {
+    echo "Error: SSH to the instance failed:"
+    cat "${SSH_ERR}"
+    echo "If the instance was re-provisioned, clear the old host key first:"
+    echo "  ssh-keygen -R '[${EIP}]:${SSH_PORT}'"
     exit 1
+}
+USER_ID=$(echo "${USERS_JSON}" | jq -r '.[] | select(.name == "default") | .id // empty')
+if [ -z "${USER_ID}" ]; then
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" "sudo headscale users create default" 2>"${SSH_ERR}" || {
+        echo "Error: could not create Headscale user 'default':"
+        cat "${SSH_ERR}"
+        exit 1
+    }
+    USER_ID=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+        "sudo headscale users list --output json" | jq -r '.[] | select(.name == "default") | .id')
 fi
 
-echo "Auth key generated."
+# One-time, short-lived key: harmless in shell history / process listings
+# after its single use or 15-minute expiry.
+KEY_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale preauthkeys create --user ${USER_ID} --expiration 15m --output json" 2>"${SSH_ERR}") || {
+    echo "Error: failed to generate auth key:"
+    cat "${SSH_ERR}"
+    exit 1
+}
+AUTH_KEY=$(echo "${KEY_JSON}" | jq -r '.key // empty')
+if [ -z "${AUTH_KEY}" ]; then
+    echo "Error: could not parse auth key from Headscale response."
+    exit 1
+fi
+echo "Auth key generated (single-use, expires in 15 minutes)."
 
 echo "=== Registering desktop with Headscale ==="
-if command -v tailscale &>/dev/null; then
-    if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; then
-        echo "Desktop is already registered and online."
-    else
-        sudo tailscale up --login-server "${HEADSCALE_URL}" --authkey "${AUTH_KEY}" --accept-routes
-        echo ""
-        echo "Desktop registered successfully."
-        echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
-    fi
-else
-    echo "Tailscale client not installed. Install it and run:"
-    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --authkey ${AUTH_KEY} --accept-routes"
-fi
+KEY_FILE=$(mktemp)
+trap 'rm -f "${SSH_ERR}" "${KEY_FILE}"' EXIT
+chmod 600 "${KEY_FILE}"
+printf '%s' "${AUTH_KEY}" > "${KEY_FILE}"
+
+sudo tailscale up \
+    --login-server "${HEADSCALE_URL}" \
+    --auth-key "file:${KEY_FILE}" \
+    --accept-routes \
+    --timeout 60s
+rm -f "${KEY_FILE}"
+
+echo ""
+echo "Desktop registered successfully."
+echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
 
 echo ""
 echo "=== Mobile Devices ==="
 echo ""
-echo "The official Tailscale mobile app does not support custom coordination servers."
-echo "Options for mobile:"
+echo "The official Tailscale app supports custom coordination servers:"
 echo ""
-echo "1. Use WireGuard directly with Headscale's generated WireGuard config:"
-echo "   - See: https://headscale.net/ref/running-headscale-community/#android"
+echo "  Android: Settings -> Accounts menu -> 'Use an alternate server'"
+echo "  iOS:     Settings -> Alternate Coordination Server URL"
 echo ""
-echo "2. Build a custom Tailscale Android app from source with your Headscale URL"
-echo "   - Clone: https://github.com/tailscale/tailscale-android"
-echo "   - Modify the default coordination server URL"
-echo "   - Build and install the APK"
+echo "  1. Enter: ${HEADSCALE_URL}"
+echo "  2. Tap Sign In — a browser page opens showing a"
+echo "     'headscale nodes register ...' command."
+echo "  3. Run that command on the server (prefix with sudo):"
+echo "     ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} \"sudo headscale nodes register ...\""
 echo ""
-echo "3. Use a different mobile VPN client that supports WireGuard directly"
-echo "   (requires manual configuration with Headscale's WireGuard config)"
+echo "No certificate installation is needed — the server uses a publicly"
+echo "trusted Let's Encrypt certificate."

@@ -5,59 +5,84 @@ set -euo pipefail
 # CLOUD-INIT TEMPLATE
 # Auto-configures Debian 12 as a Tailscale DERP relay + Headscale coordinator.
 # No WireGuard private keys on this instance — only public keys in Headscale.
+# TLS: Caddy obtains a Let's Encrypt certificate for ${headscale_domain}.
+#
+# Ordering matters: SSH access (user + port 50022) is configured FIRST, so any
+# failure in the later steps still leaves an SSH-reachable instance for
+# debugging instead of a bricked one (the security group only allows 50022).
 # ==============================================================================
 
 NEW_USER="wgadmin"
+HEADSCALE_VERSION="0.29.2"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y iptables ufw fail2ban python3-systemd curl unzip ca-certificates gnupg unattended-upgrades
-echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
-dpkg-reconfigure -f noninteractive unattended-upgrades
 
-echo "Installing AWS CLI v2..."
-cd /tmp
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-EXPECTED_SHA256=$(curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sha256")
-ACTUAL_SHA256=$(sha256sum awscliv2.zip | awk '{print $1}')
-if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
-    echo "ERROR: AWS CLI checksum verification failed!"
-    exit 1
-fi
-unzip -q awscliv2.zip
-./aws/install
-cd /
-rm -rf /tmp/aws /tmp/awscliv2.zip
+# --- 1. Operator user + SSH hardening (before anything that can fail) --------
 
 if id "$${NEW_USER}" &>/dev/null; then
     echo "User $${NEW_USER} already exists."
 else
-    if getent group "$${NEW_USER}" &>/dev/null; then
-        useradd -m -s /bin/bash -g "$${NEW_USER}" "$${NEW_USER}" || { echo "ERROR: useradd failed"; exit 1; }
-    else
-        useradd -m -s /bin/bash "$${NEW_USER}" || { echo "ERROR: useradd failed"; exit 1; }
-    fi
+    useradd -m -s /bin/bash "$${NEW_USER}"
     echo "User $${NEW_USER} created."
 fi
 
-echo "Setting up sudo for $${NEW_USER}..."
-echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/bin/journalctl, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *" > "/etc/sudoers.d/$${NEW_USER}"
-chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
-echo "Sudo configured for $${NEW_USER}."
-
-echo "Setting up SSH for $${NEW_USER}..."
-mkdir -p "/home/$${NEW_USER}/.ssh" || { echo "ERROR: mkdir failed"; exit 1; }
-echo "${ssh_public_key}" > "/home/$${NEW_USER}/.ssh/authorized_keys" || { echo "ERROR: echo failed"; exit 1; }
-chown -R "$${NEW_USER}:$${NEW_USER}" "/home/$${NEW_USER}/.ssh" || { echo "ERROR: chown failed"; exit 1; }
-chmod 700 "/home/$${NEW_USER}/.ssh" || { echo "ERROR: chmod .ssh failed"; exit 1; }
-chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys" || { echo "ERROR: chmod authorized_keys failed"; exit 1; }
-chmod 755 "/home/$${NEW_USER}" || { echo "ERROR: chmod home failed"; exit 1; }
-
+mkdir -p "/home/$${NEW_USER}/.ssh"
+# Quoted heredoc: the key is written verbatim, never shell-evaluated.
+cat > "/home/$${NEW_USER}/.ssh/authorized_keys" <<'EOKEY'
+${ssh_public_key}
+EOKEY
+chown -R "$${NEW_USER}:$${NEW_USER}" "/home/$${NEW_USER}/.ssh"
+chmod 700 "/home/$${NEW_USER}/.ssh"
+chmod 600 "/home/$${NEW_USER}/.ssh/authorized_keys"
+chmod 755 "/home/$${NEW_USER}"
 echo "SSH key installed for $${NEW_USER}."
 
+# Debian's sshd_config Includes this directory at the top; first match wins,
+# so this file takes precedence over the stock config and other drop-ins.
+cat > /etc/ssh/sshd_config.d/00-tunnel-hardening.conf <<EOSSH
+Port 50022
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+X11Forwarding no
+AllowAgentForwarding no
+AllowUsers $${NEW_USER}
+MaxAuthTries 3
+LoginGraceTime 30
+EOSSH
+
+if ! sshd -t; then
+    echo "CRITICAL: sshd_config has a syntax error."
+    exit 1
+fi
+if systemctl is-enabled ssh.socket &>/dev/null; then
+    systemctl disable --now ssh.socket
+    systemctl enable ssh.service
+fi
+systemctl restart ssh
+echo "sshd hardened and listening on 50022."
+
+# Lock the AMI's default 'admin' user: no key is provisioned for it, but it
+# ships with passwordless sudo — remove that path entirely.
+if id admin &>/dev/null; then
+    usermod -L -s /usr/sbin/nologin admin
+    gpasswd -d admin sudo 2>/dev/null || true
+    echo "Default 'admin' user locked."
+fi
+
+# --- 2. Base packages ---------------------------------------------------------
+
+apt-get update -qq
+apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install -y ufw fail2ban python3-systemd curl jq ca-certificates gnupg \
+    unattended-upgrades debian-keyring debian-archive-keyring apt-transport-https
+echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
+dpkg-reconfigure -f noninteractive unattended-upgrades
+
+# --- 3. Kernel hardening (no IP forwarding: DERP relays in userspace) ---------
+
 cat <<EOM > /etc/sysctl.d/99-security-routing.conf
-net.ipv4.ip_forward=1
 net.ipv4.conf.all.accept_source_route=0
 net.ipv4.conf.default.accept_source_route=0
 net.ipv4.conf.all.rp_filter=1
@@ -69,24 +94,35 @@ net.ipv6.conf.default.disable_ipv6=1
 EOM
 sysctl --system
 
+# --- 4. Firewall ---------------------------------------------------------------
+
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 50022/tcp comment 'SSH maintenance access'
+ufw allow 80/tcp comment 'ACME HTTP-01 + HTTPS redirect'
 ufw allow 443/tcp comment 'Headscale API + DERP HTTPS'
 ufw allow 3478/udp comment 'DERP STUN'
 ufw --force enable
 
-EIP=$(curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
-if [ -z "$EIP" ]; then
-    echo "CRITICAL: Could not determine Elastic IP from instance metadata."
-    exit 1
-fi
-echo "Detected Elastic IP: $${EIP}"
+# --- 5. fail2ban (systemd backend: Debian cloud images have no auth.log) ------
 
-echo "Installing Headscale..."
-HEADSCALE_VERSION="0.23.0"
+cat <<EOM > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+backend = systemd
+port = 50022
+maxretry = 5
+bantime = 1h
+findtime = 10m
+EOM
+systemctl enable --now fail2ban
+systemctl restart fail2ban
+
+# --- 6. Headscale --------------------------------------------------------------
+
+echo "Installing Headscale $${HEADSCALE_VERSION}..."
 curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/headscale_$${HEADSCALE_VERSION}_linux_amd64.deb" -o /tmp/headscale.deb
-curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/headscale_$${HEADSCALE_VERSION}_checksums.txt" -o /tmp/checksums.txt
+curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/checksums.txt" -o /tmp/checksums.txt
 EXPECTED_SHA256=$(grep "headscale_$${HEADSCALE_VERSION}_linux_amd64.deb" /tmp/checksums.txt | awk '{print $1}')
 ACTUAL_SHA256=$(sha256sum /tmp/headscale.deb | awk '{print $1}')
 if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
@@ -95,90 +131,137 @@ if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
     echo "Actual: $ACTUAL_SHA256"
     exit 1
 fi
-apt install -y /tmp/headscale.deb
+apt-get install -y /tmp/headscale.deb
 rm -f /tmp/headscale.deb /tmp/checksums.txt
-
-if ! id headscale &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin headscale
-fi
 
 mkdir -p /etc/headscale /var/lib/headscale
 chmod 750 /etc/headscale /var/lib/headscale
 
+# Headscale 0.29 config format. derp.urls is explicitly empty so clients only
+# ever use the embedded DERP on this host — never Tailscale Inc's relays.
 cat <<EOM > /etc/headscale/config.yaml
-server_url: https://$${EIP}:443
+server_url: https://${headscale_domain}
 listen_addr: 127.0.0.1:8080
 metrics_listen_addr: 127.0.0.1:9090
-private_key_path: /var/lib/headscale/private.key
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
 noise:
   private_key_path: /var/lib/headscale/noise_private.key
-ip_prefixes:
-  - 100.64.0.0/10
-db_type: sqlite3
-db_path: /var/lib/headscale/db.sqlite
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
 derp:
   server:
     enabled: true
     region_id: 999
     region_code: "wg-bastion"
     region_name: "WG Bastion DERP"
+    verify_clients: true
     stun_listen_addr: "0.0.0.0:3478"
-    private_key_path: /var/lib/headscale/derp_private.key
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+unix_socket: /var/run/headscale/headscale.sock
 dns:
-  base_domain: wg-bastion.local
+  magic_dns: true
+  base_domain: ts.internal
+  override_local_dns: false
+  nameservers:
+    global: []
 EOM
 
 chown -R headscale:headscale /var/lib/headscale /etc/headscale
 chmod 640 /etc/headscale/config.yaml
 
 systemctl enable headscale
-systemctl start headscale
+systemctl restart headscale
 
-echo "Waiting for Headscale to initialize..."
-sleep 5
+echo "Waiting for Headscale to become healthy..."
+HS_READY=false
+for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+        HS_READY=true
+        break
+    fi
+    sleep 2
+done
+if [ "$HS_READY" != true ]; then
+    echo "CRITICAL: Headscale did not become healthy. Recent logs:"
+    journalctl -u headscale --no-pager -n 50 || true
+    exit 1
+fi
+echo "Headscale is healthy."
 
-echo "Installing Caddy for TLS termination..."
-apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+if ! headscale users list --output json | jq -e '.[] | select(.name == "default")' >/dev/null 2>&1; then
+    headscale users create default
+    echo "Headscale user 'default' created."
+fi
+
+# --- 7. Caddy (TLS termination with Let's Encrypt) -----------------------------
+
+echo "Installing Caddy..."
 mkdir -p /etc/apt/keyrings
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy-stable.list
-apt update
-apt install -y caddy
+apt-get update -qq
+apt-get install -y caddy
 
+# Caddy fetches/renews the Let's Encrypt certificate automatically and retries
+# with backoff until the DNS A record for the domain points at this host, so a
+# missing record at first boot self-heals once DNS is set up. The TLS private
+# key is generated here and never leaves this instance.
 cat <<EOM > /etc/caddy/Caddyfile
-https://$${EIP}:443 {
-    tls internal
-    reverse_proxy localhost:8080
+${headscale_domain} {
+    reverse_proxy 127.0.0.1:8080
 }
 EOM
 
 systemctl enable caddy
 systemctl restart caddy
+echo "Caddy configured for https://${headscale_domain} (ACME happens in background)."
 
-echo "Waiting for Caddy to initialize..."
-sleep 3
+# --- 8. Scoped sudo for the operator user --------------------------------------
 
-echo "Extracting Caddy CA certificate for clients..."
-CADDY_CA_CERT=$(find /var/lib/caddy -name "root.crt" 2>/dev/null | head -1)
-if [ -n "$CADDY_CA_CERT" ]; then
-    cp "$CADDY_CA_CERT" /etc/headscale/ca.crt
-    chown $${NEW_USER}:$${NEW_USER} /etc/headscale/ca.crt
-    chmod 644 /etc/headscale/ca.crt
-    echo "CA certificate available at /etc/headscale/ca.crt"
-else
-    echo "WARNING: Could not find Caddy CA certificate."
-fi
+# Fixed-argument log reader: avoids granting unrestricted journalctl, whose
+# root pager is a shell-escape vector.
+cat <<'EOM' > /usr/local/bin/tunnel-logs
+#!/usr/bin/env bash
+exec journalctl -u headscale -u caddy -u fail2ban --no-pager -n 300
+EOM
+chmod 755 /usr/local/bin/tunnel-logs
 
-echo "Creating default Headscale user..."
-headscale users create default || echo "User 'default' already exists."
+cat > "/etc/sudoers.d/$${NEW_USER}" <<EOM
+$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/tunnel-logs, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *
+EOM
+chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
+visudo -cf "/etc/sudoers.d/$${NEW_USER}"
+echo "Sudo configured for $${NEW_USER}."
 
-echo "Headscale is running with TLS."
+# --- 9. Security updates on every boot ------------------------------------------
 
+# Refresh package lists first: this box is powered off for weeks at a time, so
+# the lists are always stale at boot. Reboot only when a newer kernel than the
+# running one is installed. Note: headscale itself is a pinned .deb outside any
+# apt repo — updating it means editing HEADSCALE_VERSION and re-provisioning.
 cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
 unattended-upgrades
+latest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+if [ -n "$${latest_kernel}" ] && [ "$(uname -r)" != "$${latest_kernel}" ]; then
+    echo "New kernel $${latest_kernel} installed (running $(uname -r)). Rebooting..."
+    systemctl reboot
+fi
 EOF
 chmod +x /usr/local/bin/startup-update.sh
 
@@ -199,30 +282,14 @@ EOF
 systemctl daemon-reload
 systemctl enable startup-update.service
 
-sed -i 's/^#\?Port.*/Port 50022/'                               /etc/ssh/sshd_config
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'            /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'                /etc/ssh/sshd_config
-sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/' /etc/ssh/sshd_config
-echo "AllowUsers $${NEW_USER}" >> /etc/ssh/sshd_config
-echo "MaxAuthTries 3"          >> /etc/ssh/sshd_config
-echo "LoginGraceTime 30"       >> /etc/ssh/sshd_config
+# --- 10. Final verification + reboot if the upgraded kernel requires it ---------
 
-if ! sshd -t; then
-    echo "CRITICAL: sshd_config has a syntax error."
-    exit 1
-fi
-if systemctl is-enabled ssh.socket &>/dev/null; then
-    systemctl disable --now ssh.socket
-    systemctl enable ssh.service
-fi
+systemctl is-active --quiet headscale || { echo "CRITICAL: headscale not active"; exit 1; }
+systemctl is-active --quiet caddy || { echo "CRITICAL: caddy not active"; exit 1; }
+echo "Provisioning complete: headscale + caddy active, sshd on 50022."
 
-echo "SSH configuration validated. Restarting SSH..."
-systemctl restart ssh
-echo "SSH restarted successfully."
-
-if [ -f /var/run/reboot-required ]; then
-    echo "Security updates require a reboot. Rebooting now..."
+latest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+if [ -n "$${latest_kernel}" ] && [ "$(uname -r)" != "$${latest_kernel}" ]; then
+    echo "Kernel upgrade pending ($(uname -r) -> $${latest_kernel}). Rebooting..."
     systemctl reboot
 fi

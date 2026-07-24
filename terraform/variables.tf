@@ -19,3 +19,19 @@ variable "kms_ebs_key_id" {
   description = "KMS key ID for EBS volume encryption (BYOK)"
   type        = string
 }
+
+variable "headscale_domain" {
+  description = "Fully-qualified domain name for the Headscale endpoint (e.g. hs.example.com). Must have an A record pointing at the Elastic IP; Caddy obtains a Let's Encrypt certificate for it on the instance."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}$", var.headscale_domain))
+    error_message = "headscale_domain must be a fully-qualified DNS name, e.g. hs.example.com."
+  }
+}
+
+variable "route53_zone_id" {
+  description = "Optional Route53 hosted zone ID. When set, Terraform manages the A record for headscale_domain -> Elastic IP. Leave empty to manage DNS at your own provider."
+  type        = string
+  default     = ""
+}

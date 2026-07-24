@@ -5,58 +5,78 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 TF_DIR="${SCRIPT_DIR}/../terraform"
+SSH_OPTS=(-i "${SSH_KEY}" -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
-echo "Fetching Elastic IP from Terraform..."
-EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip)
-
-if [ -z "$EIP" ] || [[ "$EIP" == *"No outputs found"* ]]; then
-    echo "Error: Could not retrieve Elastic IP. Did 'terraform apply' succeed?"
+echo "Fetching Terraform outputs..."
+EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip 2>/dev/null) || {
+    echo "Error: could not read wg_elastic_ip output. Did 'terraform apply' succeed?"
     exit 1
-fi
-
-HEADSCALE_URL="https://${EIP}:443"
+}
+HEADSCALE_URL=$(terraform -chdir="${TF_DIR}" output -raw headscale_url 2>/dev/null) || {
+    echo "Error: could not read headscale_url output. Did 'terraform apply' succeed?"
+    exit 1
+}
 
 echo "=== Adding a New Device ==="
 echo ""
-echo "Headscale must be running (EC2 must be up) to generate auth keys."
-echo ""
-
-read -r -p "Is the tunnel currently running? [y/N] " REPLY
-if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-    echo ""
+if ! curl -fsS --max-time 5 "${HEADSCALE_URL}/health" > /dev/null 2>&1; then
+    echo "Headscale is not reachable at ${HEADSCALE_URL}."
     echo "Start the tunnel first:"
     echo "  bash scripts/vpn-up.sh"
-    echo ""
-    echo "Then re-run this script."
-    exit 0
+    exit 1
 fi
+echo "Headscale is up at ${HEADSCALE_URL}."
 
 echo ""
-echo "Generating auth key via SSH..."
-AUTH_KEY=$(ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 -o StrictHostKeyChecking=accept-new wgadmin@"${EIP}" \
-    "sudo headscale preauthkeys create --user default --reusable" 2>/dev/null || echo "")
+echo "Generating one-time auth key via SSH..."
+SSH_ERR=$(mktemp)
+trap 'rm -f "${SSH_ERR}"' EXIT
 
-if [ -z "$AUTH_KEY" ]; then
-    echo "Error: Failed to generate auth key. Check SSH connectivity and Headscale status."
+USER_ID=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale users list --output json" 2>"${SSH_ERR}" \
+    | jq -r '.[] | select(.name == "default") | .id // empty') || {
+    echo "Error: SSH to the instance failed:"
+    cat "${SSH_ERR}"
+    echo "If the instance was re-provisioned, clear the old host key first:"
+    echo "  ssh-keygen -R '[${EIP}]:${SSH_PORT}'"
+    exit 1
+}
+if [ -z "${USER_ID}" ]; then
+    echo "Error: Headscale user 'default' not found on the server."
+    exit 1
+fi
+
+KEY_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale preauthkeys create --user ${USER_ID} --expiration 15m --output json" 2>"${SSH_ERR}") || {
+    echo "Error: failed to generate auth key:"
+    cat "${SSH_ERR}"
+    exit 1
+}
+AUTH_KEY=$(echo "${KEY_JSON}" | jq -r '.key // empty')
+if [ -z "${AUTH_KEY}" ]; then
+    echo "Error: could not parse auth key from Headscale response."
     exit 1
 fi
 
 echo ""
-echo "Auth key generated successfully!"
+echo "Auth key generated (single-use, expires in 15 minutes)."
 echo ""
-echo "=== New Device Setup ==="
+echo "=== Linux / desktop device ==="
 echo ""
-echo "On the new device:"
+echo "On the new device, run (key is one-time and expires in 15 min, so it is"
+echo "harmless in shell history afterwards):"
 echo ""
-echo "1. Download the CA certificate from the EC2 instance:"
-echo "   scp -i ~/.ssh/wg_ec2_ed25519 -P 50022 wgadmin@${EIP}:/etc/headscale/ca.crt /tmp/headscale-ca.crt"
+echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --auth-key ${AUTH_KEY} --accept-routes"
 echo ""
-echo "2. Install the CA certificate into the system trust store:"
-echo "   sudo cp /tmp/headscale-ca.crt /usr/local/share/ca-certificates/headscale-ca.crt"
-echo "   sudo update-ca-certificates"
+echo "=== Mobile device (official Tailscale app) ==="
 echo ""
-echo "3. Register with Headscale:"
-echo "   sudo tailscale up --login-server ${HEADSCALE_URL} --authkey ${AUTH_KEY} --accept-routes"
+echo "  Android: Settings -> Accounts menu -> 'Use an alternate server'"
+echo "  iOS:     Settings -> Alternate Coordination Server URL"
+echo ""
+echo "  1. Enter: ${HEADSCALE_URL}"
+echo "  2. Tap Sign In — a browser page opens showing a"
+echo "     'headscale nodes register ...' command."
+echo "  3. Run that command on the server (prefix with sudo):"
+echo "     ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} \"sudo headscale nodes register ...\""
 echo ""
 echo "The device will get an IP in the 100.64.0.0/10 range."
-echo "You can then access it from other Tailscale devices."
