@@ -201,7 +201,7 @@ bash scripts/add-device.sh
 This checks that Headscale is reachable, generates a **single-use, 15-minute** auth key, and prints setup instructions:
 
 - **Linux/desktop:** one `tailscale up` command with the key (safe to have in history — single-use and expired within 15 minutes).
-- **Mobile:** the **official Tailscale app** supports custom coordination servers — Android: "Use an alternate server"; iOS: "Alternate Coordination Server URL". Enter your Headscale URL, sign in, and run the `headscale nodes register ...` command the browser page shows (via SSH with sudo). No certificate installation is needed.
+- **Mobile:** the **official Tailscale app** supports custom coordination servers — Android: "Use an alternate server"; iOS: "Alternate Coordination Server URL". Enter your Headscale URL, then either sign in with the auth key directly (Android: sign-in menu → "Use auth key") or use the browser flow: sign in and run the registration command the page shows via SSH with sudo, replacing `USERNAME` with `default` (on Headscale 0.29: `headscale auth register --auth-id hskey-authreq-... --user default`). No certificate installation is needed.
 
 > Headscale must be running (EC2 must be up) to generate auth keys. Start the tunnel first with `vpn-up.sh`.
 

@@ -239,7 +239,7 @@ EOM
 chmod 755 /usr/local/bin/tunnel-logs
 
 cat > "/etc/sudoers.d/$${NEW_USER}" <<EOM
-$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/tunnel-logs, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *
+$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/tunnel-logs, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *, /usr/bin/headscale auth *
 EOM
 chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
 visudo -cf "/etc/sudoers.d/$${NEW_USER}"
