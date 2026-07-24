@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ==============================================================================
 # CLOUD-INIT TEMPLATE
-# Auto-configures Debian 12 as a WireGuard hub: UFW, WireGuard, Fail2Ban,
-# and a boot-time security update service.
+# Auto-configures Debian 12 as a Tailscale DERP relay + Headscale coordinator.
+# No WireGuard private keys on this instance — only public keys in Headscale.
 # ==============================================================================
 
 NEW_USER="wgadmin"
@@ -12,7 +12,7 @@ NEW_USER="wgadmin"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y wireguard iptables ufw fail2ban python3-systemd curl unzip unattended-upgrades
+apt-get install -y iptables ufw fail2ban python3-systemd curl unzip ca-certificates gnupg unattended-upgrades
 echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
 dpkg-reconfigure -f noninteractive unattended-upgrades
 
@@ -42,7 +42,7 @@ else
 fi
 
 echo "Setting up sudo for $${NEW_USER}..."
-echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/bin/wg, /usr/sbin/ufw, /usr/bin/journalctl" > "/etc/sudoers.d/$${NEW_USER}"
+echo "$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/bin/journalctl, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *" > "/etc/sudoers.d/$${NEW_USER}"
 chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
 echo "Sudo configured for $${NEW_USER}."
 
@@ -69,126 +69,110 @@ net.ipv6.conf.default.disable_ipv6=1
 EOM
 sysctl --system
 
-sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 50022/tcp comment 'SSH emergency access'
-ufw allow 51920/udp comment 'WireGuard tunnel'
-ufw allow in on wg0 comment 'Trust internal VPN traffic'
+ufw allow 50022/tcp comment 'SSH maintenance access'
+ufw allow 443/tcp comment 'Headscale API + DERP HTTPS'
+ufw allow 3478/udp comment 'DERP STUN'
 ufw --force enable
 
-ETH_IF=$(ip route list default | awk '{print $5}' | head -n 1)
-
-mkdir -p /etc/wireguard
-chmod 700 /etc/wireguard
-
-echo "Fetching WireGuard server key from SSM..."
-for i in 1 2 3 4 5; do
-    if WG_SERVER_KEY=$(aws ssm get-parameter \
-      --name "/wg-bastion/server-private-key" \
-      --region "${region}" \
-      --with-decryption \
-      --query "Parameter.Value" \
-      --output text 2>/dev/null); then
-        break
-    fi
-    echo "SSM fetch attempt $i failed, waiting 10s for IAM propagation..."
-    sleep 10
-done
-
-if [ -z "$WG_SERVER_KEY" ]; then
-    echo "CRITICAL: Failed to fetch server key from SSM after 5 attempts."
-    echo "Check IAM role permissions and SSM parameter existence."
+EIP=$(curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
+if [ -z "$EIP" ]; then
+    echo "CRITICAL: Could not determine Elastic IP from instance metadata."
     exit 1
 fi
+echo "Detected Elastic IP: $${EIP}"
 
-%{ for name, peer in wg_peers ~}
-echo "Fetching PSK for peer '${name}' from SSM..."
-for i in 1 2 3 4 5; do
-    if PEER_PSK_${replace(name, "-", "_")}=$(aws ssm get-parameter \
-      --name "/wg-bastion/peer-psk/${name}" \
-      --region "${region}" \
-      --with-decryption \
-      --query "Parameter.Value" \
-      --output text 2>/dev/null); then
-        break
-    fi
-    echo "SSM fetch attempt $i for ${name} failed, waiting 10s..."
-    sleep 10
-done
-
-if [ -z "$${PEER_PSK_${replace(name, "-", "_")}}" ]; then
-    echo "CRITICAL: Failed to fetch PSK for peer '${name}' after 5 attempts."
+echo "Installing Headscale..."
+HEADSCALE_VERSION="0.23.0"
+curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/headscale_$${HEADSCALE_VERSION}_linux_amd64.deb" -o /tmp/headscale.deb
+curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/headscale_$${HEADSCALE_VERSION}_checksums.txt" -o /tmp/checksums.txt
+EXPECTED_SHA256=$(grep "headscale_$${HEADSCALE_VERSION}_linux_amd64.deb" /tmp/checksums.txt | awk '{print $1}')
+ACTUAL_SHA256=$(sha256sum /tmp/headscale.deb | awk '{print $1}')
+if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+    echo "ERROR: Headscale checksum verification failed!"
+    echo "Expected: $EXPECTED_SHA256"
+    echo "Actual: $ACTUAL_SHA256"
     exit 1
 fi
-%{ endfor ~}
+apt install -y /tmp/headscale.deb
+rm -f /tmp/headscale.deb /tmp/checksums.txt
 
-cat <<EOM > /etc/wireguard/wg0.conf
-[Interface]
-PrivateKey = $${WG_SERVER_KEY}
-ListenPort = 51920
-Address = 10.10.0.1/24
+if ! id headscale &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin headscale
+fi
 
-PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $${ETH_IF} -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $${ETH_IF} -j MASQUERADE
+mkdir -p /etc/headscale /var/lib/headscale
+chmod 750 /etc/headscale /var/lib/headscale
 
-%{ for name, peer in wg_peers ~}
-[Peer]
-# ${name}
-PublicKey    = ${peer.public_key}
-PresharedKey = $${PEER_PSK_${replace(name, "-", "_")}}
-AllowedIPs   = ${peer.ip}/32
-PersistentKeepalive = 25
-
-%{ endfor ~}
+cat <<EOM > /etc/headscale/config.yaml
+server_url: https://$${EIP}:443
+listen_addr: 127.0.0.1:8080
+metrics_listen_addr: 127.0.0.1:9090
+private_key_path: /var/lib/headscale/private.key
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+ip_prefixes:
+  - 100.64.0.0/10
+db_type: sqlite3
+db_path: /var/lib/headscale/db.sqlite
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "wg-bastion"
+    region_name: "WG Bastion DERP"
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_private.key
+dns:
+  base_domain: wg-bastion.local
 EOM
 
-chmod 600 /etc/wireguard/wg0.conf
-systemctl enable wg-quick@wg0
-systemctl start wg-quick@wg0
+chown -R headscale:headscale /var/lib/headscale /etc/headscale
+chmod 640 /etc/headscale/config.yaml
 
-cat <<EOM > /etc/fail2ban/jail.local
-[DEFAULT]
-backend = systemd
-banaction = ufw
-findtime = 10m
+systemctl enable headscale
+systemctl start headscale
 
-[sshd]
-enabled  = true
-port     = 50022
-filter   = sshd
-maxretry = 3
-bantime  = 24h
+echo "Waiting for Headscale to initialize..."
+sleep 5
+
+echo "Installing Caddy for TLS termination..."
+apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+mkdir -p /etc/apt/keyrings
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy-stable.list
+apt update
+apt install -y caddy
+
+cat <<EOM > /etc/caddy/Caddyfile
+https://$${EIP}:443 {
+    tls internal
+    reverse_proxy localhost:8080
+}
 EOM
-systemctl enable fail2ban
-systemctl restart fail2ban
 
-sed -i 's/^#\?Port.*/Port 50022/'                               /etc/ssh/sshd_config
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'            /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'                /etc/ssh/sshd_config
-sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/' /etc/ssh/sshd_config
-echo "AllowUsers $${NEW_USER}" >> /etc/ssh/sshd_config
-echo "MaxAuthTries 3"          >> /etc/ssh/sshd_config
-echo "LoginGraceTime 30"       >> /etc/ssh/sshd_config
+systemctl enable caddy
+systemctl restart caddy
 
-if ! sshd -t; then
-    echo "CRITICAL: sshd_config has a syntax error — check /etc/ssh/sshd_config and fix before rebooting."
-    exit 1
-fi
-# On socket-activated sshd (Debian 13+/Ubuntu) the listening port comes from
-# ssh.socket, not sshd_config, so the Port directive above would be ignored and
-# the only allowed SG port (50022) would never be served. Debian 12 uses the
-# classic always-on service, so this block is a no-op there.
-if systemctl is-enabled ssh.socket &>/dev/null; then
-    systemctl disable --now ssh.socket
-    systemctl enable ssh.service
+echo "Waiting for Caddy to initialize..."
+sleep 3
+
+echo "Extracting Caddy CA certificate for clients..."
+CADDY_CA_CERT=$(find /var/lib/caddy -name "root.crt" 2>/dev/null | head -1)
+if [ -n "$CADDY_CA_CERT" ]; then
+    cp "$CADDY_CA_CERT" /etc/headscale/ca.crt
+    chown $${NEW_USER}:$${NEW_USER} /etc/headscale/ca.crt
+    chmod 644 /etc/headscale/ca.crt
+    echo "CA certificate available at /etc/headscale/ca.crt"
+else
+    echo "WARNING: Could not find Caddy CA certificate."
 fi
 
-echo "SSH configuration validated. Restarting SSH..."
-systemctl restart ssh
-echo "SSH restarted successfully."
+echo "Creating default Headscale user..."
+headscale users create default || echo "User 'default' already exists."
+
+echo "Headscale is running with TLS."
 
 cat << 'EOF' > /usr/local/bin/startup-update.sh
 #!/usr/bin/env bash
@@ -214,6 +198,29 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable startup-update.service
+
+sed -i 's/^#\?Port.*/Port 50022/'                               /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'            /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/'                /etc/ssh/sshd_config
+sed -i 's/^#\?AllowAgentForwarding.*/AllowAgentForwarding no/' /etc/ssh/sshd_config
+echo "AllowUsers $${NEW_USER}" >> /etc/ssh/sshd_config
+echo "MaxAuthTries 3"          >> /etc/ssh/sshd_config
+echo "LoginGraceTime 30"       >> /etc/ssh/sshd_config
+
+if ! sshd -t; then
+    echo "CRITICAL: sshd_config has a syntax error."
+    exit 1
+fi
+if systemctl is-enabled ssh.socket &>/dev/null; then
+    systemctl disable --now ssh.socket
+    systemctl enable ssh.service
+fi
+
+echo "SSH configuration validated. Restarting SSH..."
+systemctl restart ssh
+echo "SSH restarted successfully."
 
 if [ -f /var/run/reboot-required ]; then
     echo "Security updates require a reboot. Rebooting now..."

@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# vpn-down.sh
-# Closes local tunnel and cleanly halts AWS compute.
-# ==============================================================================
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-echo "Shutting down local WireGuard tunnel..."
-sudo systemctl stop wg-quick@wg0
+echo "Stopping local Tailscale client..."
+if command -v tailscale &>/dev/null; then
+    sudo tailscale down 2>/dev/null || true
+fi
 
 echo "Locating running instance to halt..."
 INSTANCE_ID=$(aws ec2 describe-instances \

@@ -5,33 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 TF_DIR="${SCRIPT_DIR}/../terraform"
-PEERS_JSON="${TF_DIR}/peers.auto.tfvars.json"
-
-command -v jq &>/dev/null || { echo "Error: 'jq' is required. Run: sudo pacman -S jq"; exit 1; }
-
-if [ ! -f "${PEERS_JSON}" ]; then
-    echo "Error: ${PEERS_JSON} not found. Run 01-bootstrap.sh first."
-    exit 1
-fi
-
-if ! jq empty "${PEERS_JSON}" 2>/dev/null; then
-    echo "Error: ${PEERS_JSON} is not valid JSON."
-    exit 1
-fi
-
-if ! jq -e '.wg_peers.desktop' "${PEERS_JSON}" &>/dev/null; then
-    echo "Error: No 'desktop' entry found in ${PEERS_JSON}."
-    exit 1
-fi
-
-PEER_COUNT=$(jq -r '.wg_peers | keys | length' "${PEERS_JSON}")
-if [ "$PEER_COUNT" -eq 0 ]; then
-    echo "Error: No peers defined in ${PEERS_JSON}."
-    exit 1
-fi
-
-echo "Checking prerequisites..."
-[ -f ~/wireguard-keys/server.pub ] || { echo "Error: Missing server pubkey."; exit 1; }
 
 echo "Fetching Elastic IP from Terraform..."
 EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip)
@@ -41,107 +14,100 @@ if [ -z "$EIP" ] || [[ "$EIP" == *"No outputs found"* ]]; then
     exit 1
 fi
 
-PHYS_IF=$(ip route list default | awk '{print $5}' | head -n 1)
-if [ -z "$PHYS_IF" ]; then
-    echo "Error: Could not detect default network interface."
+HEADSCALE_URL="https://${EIP}:443"
+
+echo "=== Ensuring EC2 is running ==="
+INSTANCE_ID=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=running" \
+    --query "Reservations[0].Instances[0].InstanceId" \
+    --output text)
+
+if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+    echo "EC2 is not running. Starting it..."
+    INSTANCE_ID=$(aws ec2 describe-instances \
+        --region "$REGION" \
+        --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=stopped" \
+        --query "Reservations[0].Instances[0].InstanceId" \
+        --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo "Error: Could not find a stopped bastion instance."
+        exit 1
+    fi
+    aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+    aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+    aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$REGION"
+    echo "EC2 is running. Waiting for Headscale..."
+    MAX_WAIT=120; ELAPSED=0
+    until curl -fsSL -k --max-time 5 "${HEADSCALE_URL}" > /dev/null 2>&1; do
+        echo -n "."
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+            echo ""
+            echo "Error: Headscale did not become ready within ${MAX_WAIT}s."
+            exit 1
+        fi
+    done
+    echo ""
+fi
+
+echo "=== Downloading CA certificate ==="
+CA_CERT="/tmp/headscale-ca.crt"
+scp -i ~/.ssh/wg_ec2_ed25519 -P 50022 -o StrictHostKeyChecking=accept-new \
+    wgadmin@"${EIP}":/etc/headscale/ca.crt "${CA_CERT}" 2>/dev/null
+
+if [ ! -f "${CA_CERT}" ]; then
+    echo "Error: Could not download CA certificate from EC2."
     exit 1
 fi
-echo "Detected physical interface: ${PHYS_IF}"
 
-echo "=== Configuring Desktop WireGuard (/etc/wireguard/wg0.conf) ==="
-if [ -f /etc/wireguard/wg0.conf ]; then
-    read -r -p "WARNING: /etc/wireguard/wg0.conf already exists. Overwrite it? [y/N] " REPLY
-    REPLY="${REPLY:-n}"
+echo "=== Installing CA certificate into system trust store ==="
+sudo cp "${CA_CERT}" /etc/ca-certificates/trust-source/anchors/headscale-ca.crt 2>/dev/null \
+    || sudo cp "${CA_CERT}" /usr/local/share/ca-certificates/headscale-ca.crt
+sudo update-ca-certificates 2>/dev/null || sudo update-ca-trust 2>/dev/null || true
+rm -f "${CA_CERT}"
+echo "CA certificate installed."
+
+echo "=== Generating auth key ==="
+AUTH_KEY=$(ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 -o StrictHostKeyChecking=accept-new wgadmin@"${EIP}" \
+    "sudo headscale preauthkeys create --user default --reusable" 2>/dev/null || echo "")
+
+if [ -z "$AUTH_KEY" ]; then
+    echo "Error: Failed to generate auth key."
+    exit 1
+fi
+
+echo "Auth key generated."
+
+echo "=== Registering desktop with Headscale ==="
+if command -v tailscale &>/dev/null; then
+    if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; then
+        echo "Desktop is already registered and online."
+    else
+        sudo tailscale up --login-server "${HEADSCALE_URL}" --authkey "${AUTH_KEY}" --accept-routes
+        echo ""
+        echo "Desktop registered successfully."
+        echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+    fi
 else
-    REPLY="y"
+    echo "Tailscale client not installed. Install it and run:"
+    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --authkey ${AUTH_KEY} --accept-routes"
 fi
 
-if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-    if systemctl is-active --quiet wg-quick@wg0; then
-        echo "Bringing WireGuard interface down..."
-        sudo systemctl stop wg-quick@wg0
-    fi
-
-    sudo mkdir -p /etc/wireguard
-    
-    DESKTOP_IP=$(jq -r '.wg_peers.desktop.ip' "${PEERS_JSON}")
-    if [ -z "$DESKTOP_IP" ] || [ "$DESKTOP_IP" = "null" ]; then
-        echo "Error: Desktop IP not found in ${PEERS_JSON}."
-        exit 1
-    fi
-    
-    if [ ! -f ~/wireguard-keys/desktop.key ]; then
-        echo "Error: ~/wireguard-keys/desktop.key not found."
-        exit 1
-    fi
-    
-    DESKTOP_KEY=$(cat ~/wireguard-keys/desktop.key)
-    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
-    DESKTOP_PSK=$(cat ~/wireguard-keys/desktop.psk)
-    
-    sudo bash -c "cat <<WGEOF > /etc/wireguard/wg0.conf
-[Interface]
-PrivateKey = ${DESKTOP_KEY}
-Address = ${DESKTOP_IP}/24
-
-PostUp   = iptables -I FORWARD -i wg0 -o ${PHYS_IF} -j DROP
-PostDown = iptables -D FORWARD -i wg0 -o ${PHYS_IF} -j DROP
-
-[Peer]
-PublicKey    = ${SERVER_PUB}
-PresharedKey = ${DESKTOP_PSK}
-Endpoint     = ${EIP}:51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 30
-WGEOF"
-    sudo chmod 600 /etc/wireguard/wg0.conf
-    echo "Desktop configured securely."
-fi
-
-echo "=== Generating Mobile Configurations ==="
-
-MOBILE_CLIENTS=$(jq -r '.wg_peers | to_entries[] | select(.key != "desktop") | .key' "${PEERS_JSON}")
-
-if [ -z "$MOBILE_CLIENTS" ]; then
-    echo "No mobile clients found in ${PEERS_JSON}."
-    exit 0
-fi
-
-for client in $MOBILE_CLIENTS; do
-    CLIENT_IP=$(jq -r ".wg_peers.${client}.ip" "${PEERS_JSON}")
-    
-    if [ -z "$CLIENT_IP" ] || [ "$CLIENT_IP" = "null" ]; then
-        echo "Warning: No IP found for ${client} in ${PEERS_JSON}, skipping."
-        continue
-    fi
-    
-    if [ ! -f ~/wireguard-keys/${client}.key ]; then
-        echo "Warning: Key file for ${client} not found, skipping."
-        continue
-    fi
-    
-    echo ""
-    echo "--------------------------------------------------------"
-    echo " Scan this QR code with your ${client^}'s WireGuard app:"
-    echo "--------------------------------------------------------"
-    echo ""
-    
-    CLIENT_KEY=$(cat ~/wireguard-keys/${client}.key)
-    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
-    CLIENT_PSK=$(cat ~/wireguard-keys/${client}.psk)
-    
-    qrencode -t ansiutf8 <<QREOF
-[Interface]
-PrivateKey = ${CLIENT_KEY}
-Address = ${CLIENT_IP}/24
-
-[Peer]
-PublicKey    = ${SERVER_PUB}
-PresharedKey = ${CLIENT_PSK}
-Endpoint     = ${EIP}:51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 25
-QREOF
-    
-    read -r -p "Press [Enter] to continue to the next device..."
-done
+echo ""
+echo "=== Mobile Devices ==="
+echo ""
+echo "The official Tailscale mobile app does not support custom coordination servers."
+echo "Options for mobile:"
+echo ""
+echo "1. Use WireGuard directly with Headscale's generated WireGuard config:"
+echo "   - See: https://headscale.net/ref/running-headscale-community/#android"
+echo ""
+echo "2. Build a custom Tailscale Android app from source with your Headscale URL"
+echo "   - Clone: https://github.com/tailscale/tailscale-android"
+echo "   - Modify the default coordination server URL"
+echo "   - Build and install the APK"
+echo ""
+echo "3. Use a different mobile VPN client that supports WireGuard directly"
+echo "   (requires manual configuration with Headscale's WireGuard config)"

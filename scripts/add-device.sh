@@ -1,106 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ -z "${1:-}" ]; then
-    echo "Usage: $0 <device_name>"
-    echo "Example: $0 laptop"
-    exit 1
-fi
-
-DEVICE="${1,,}"
-if [[ ! "$DEVICE" =~ ^[a-z0-9-]+$ ]]; then
-    echo "Error: Device name must contain only lowercase letters, numbers, and hyphens."
-    exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-PEERS_JSON="${SCRIPT_DIR}/../terraform/peers.auto.tfvars.json"
-KEYS_DIR="$HOME/wireguard-keys"
+source "${SCRIPT_DIR}/config.sh"
 
-command -v jq &>/dev/null || { echo "Error: 'jq' is required. Run: sudo pacman -S jq"; exit 1; }
-command -v qrencode &>/dev/null || { echo "Error: 'qrencode' is required. Run: sudo pacman -S qrencode"; exit 1; }
+TF_DIR="${SCRIPT_DIR}/../terraform"
 
-mkdir -p "${KEYS_DIR}"
-cd "${KEYS_DIR}"
+echo "Fetching Elastic IP from Terraform..."
+EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip)
 
-cleanup() {
-    if [ -f "${KEYS_DIR}/tmp.json" ]; then
-        rm -f "${KEYS_DIR}/tmp.json"
-    fi
-}
-trap cleanup EXIT
-
-if [ -f "${DEVICE}.key" ]; then
-    echo "Error: Keys for '${DEVICE}' already exist in ${KEYS_DIR}."
+if [ -z "$EIP" ] || [[ "$EIP" == *"No outputs found"* ]]; then
+    echo "Error: Could not retrieve Elastic IP. Did 'terraform apply' succeed?"
     exit 1
 fi
 
-if [ -f "${PEERS_JSON}" ]; then
-    if ! jq empty "${PEERS_JSON}" 2>/dev/null; then
-        echo "Error: ${PEERS_JSON} is not valid JSON. Please fix it before adding a device."
-        exit 1
-    fi
-    
-    if jq -e ".wg_peers[\"${DEVICE}\"]" "${PEERS_JSON}" > /dev/null; then
-        echo "Error: Device '${DEVICE}' already exists in ${PEERS_JSON}."
-        exit 1
-    fi
+HEADSCALE_URL="https://${EIP}:443"
+
+echo "=== Adding a New Device ==="
+echo ""
+echo "Headscale must be running (EC2 must be up) to generate auth keys."
+echo ""
+
+read -r -p "Is the tunnel currently running? [y/N] " REPLY
+if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "Start the tunnel first:"
+    echo "  bash scripts/vpn-up.sh"
+    echo ""
+    echo "Then re-run this script."
+    exit 0
 fi
 
-echo "=== Generating Keys for ${DEVICE} ==="
-umask 077
-wg genkey > "${DEVICE}.key" && wg pubkey < "${DEVICE}.key" > "${DEVICE}.pub"
-wg genpsk > "${DEVICE}.psk"
+echo ""
+echo "Generating auth key via SSH..."
+AUTH_KEY=$(ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 -o StrictHostKeyChecking=accept-new wgadmin@"${EIP}" \
+    "sudo headscale preauthkeys create --user default --reusable" 2>/dev/null || echo "")
 
-PUB_KEY=$(cat "${DEVICE}.pub")
-PSK_KEY=$(cat "${DEVICE}.psk")
-
-echo "=== Updating Terraform Peers State ==="
-if [ ! -f "${PEERS_JSON}" ] || [ ! -s "${PEERS_JSON}" ]; then
-    echo '{"wg_peers": {}}' > "${PEERS_JSON}"
-fi
-
-LAST_OCTET=$(jq -r 'if (.wg_peers | length) == 0 then 1 else [.wg_peers[].ip | split(".")[3] | tonumber] | max end' "${PEERS_JSON}")
-NEXT_OCTET=$((LAST_OCTET + 1))
-
-if [ "$NEXT_OCTET" -gt 254 ]; then
-    echo "Error: No available IPs in 10.10.0.0/24 subnet (max 252 peers)."
-    rm -f "${DEVICE}.key" "${DEVICE}.pub" "${DEVICE}.psk"
+if [ -z "$AUTH_KEY" ]; then
+    echo "Error: Failed to generate auth key. Check SSH connectivity and Headscale status."
     exit 1
 fi
 
-if jq -e --arg ip "10.10.0.${NEXT_OCTET}" '.wg_peers[] | select(.ip == $ip)' "${PEERS_JSON}" > /dev/null 2>&1; then
-    echo "Error: IP 10.10.0.${NEXT_OCTET} is already in use. Check ${PEERS_JSON} for conflicts."
-    rm -f "${DEVICE}.key" "${DEVICE}.pub" "${DEVICE}.psk"
-    exit 1
-fi
-
-NEW_IP="10.10.0.${NEXT_OCTET}"
-
-umask 077
-jq --arg dev "$DEVICE" \
-   --arg pub "$PUB_KEY" \
-   --arg psk "$PSK_KEY" \
-   --arg ip "$NEW_IP" \
-   '.wg_peers[$dev] = {"public_key": $pub, "psk": $psk, "ip": $ip}' "${PEERS_JSON}" > tmp.json && mv tmp.json "${PEERS_JSON}"
-
-echo "Successfully added ${DEVICE} with IP ${NEW_IP} to ${PEERS_JSON}."
 echo ""
-echo "=== NEXT STEPS ==="
-echo "1. cd terraform && terraform apply"
-echo "2. Generate your QR code by running this exact command:"
+echo "Auth key generated successfully!"
 echo ""
-
-cat << EOF
-bash -c 'echo "[Interface]
-PrivateKey = \$(cat ~/wireguard-keys/${DEVICE}.key)
-Address = ${NEW_IP}/24
-
-[Peer]
-PublicKey    = \$(cat ~/wireguard-keys/server.pub)
-PresharedKey = \$(cat ~/wireguard-keys/${DEVICE}.psk)
-Endpoint     = \$(terraform -chdir=${SCRIPT_DIR}/../terraform output -raw wg_elastic_ip):51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 25" | qrencode -t ansiutf8'
-EOF
+echo "=== New Device Setup ==="
 echo ""
+echo "On the new device:"
+echo ""
+echo "1. Download the CA certificate from the EC2 instance:"
+echo "   scp -i ~/.ssh/wg_ec2_ed25519 -P 50022 wgadmin@${EIP}:/etc/headscale/ca.crt /tmp/headscale-ca.crt"
+echo ""
+echo "2. Install the CA certificate into the system trust store:"
+echo "   sudo cp /tmp/headscale-ca.crt /usr/local/share/ca-certificates/headscale-ca.crt"
+echo "   sudo update-ca-certificates"
+echo ""
+echo "3. Register with Headscale:"
+echo "   sudo tailscale up --login-server ${HEADSCALE_URL} --authkey ${AUTH_KEY} --accept-routes"
+echo ""
+echo "The device will get an IP in the 100.64.0.0/10 range."
+echo "You can then access it from other Tailscale devices."

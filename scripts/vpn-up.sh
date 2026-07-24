@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-echo "=== 1. Locating WireGuard Bastion on AWS ==="
+echo "=== 1. Locating Tailscale Bastion on AWS ==="
 INSTANCE_ID=$(aws ec2 describe-instances \
     --region "$REGION" \
     --filters "Name=tag:Name,Values=wg-bastion" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
@@ -58,32 +58,58 @@ if [ "$FRESHLY_STARTED" = true ]; then
     aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$REGION"
 fi
 
-echo "=== 3. Establishing Encrypted Tunnel ==="
-echo "Starting local WireGuard interface..."
-sudo systemctl start wg-quick@wg0
+echo "=== 3. Waiting for Headscale to be ready ==="
+EIP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+    --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
 
-if [ "$FRESHLY_STARTED" = true ]; then
-    echo "Allowing 15s for remote EC2 startup-update service to run..."
-    sleep 15
+if [ -z "$EIP" ] || [ "$EIP" == "None" ]; then
+    echo "Error: Could not retrieve Elastic IP."
+    exit 1
 fi
 
-echo "Polling remote interface..."
-MAX_WAIT=180; ELAPSED=0
-until sudo wg show wg0 > /dev/null 2>&1 && \
-      sudo wg show wg0 | grep -qE "latest handshake:[[:space:]]+[0-9]"; do
+HEADSCALE_URL="https://${EIP}:443"
+MAX_WAIT=120; ELAPSED=0
+until curl -fsSL -k --max-time 5 "${HEADSCALE_URL}" > /dev/null 2>&1; do
     echo -n "."
     sleep 2
     ELAPSED=$((ELAPSED + 2))
     if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
         echo ""
-        EIP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
-            --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null || echo "<EIP>")
-        echo "Error: Tunnel did not come up within ${MAX_WAIT}s."
-        echo "SSH directly to check logs: ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 wgadmin@${EIP}"
-        echo "Then run: journalctl -u wg-quick@wg0 -u startup-update"
+        echo "Error: Headscale did not become ready within ${MAX_WAIT}s."
+        echo "SSH to check logs: ssh -i ~/.ssh/wg_ec2_ed25519 -p 50022 wgadmin@${EIP}"
+        echo "Then run: journalctl -u headscale"
         exit 1
     fi
 done
 
 echo ""
-echo "Connection verified! Tunnel is active."
+echo "Headscale is ready at ${HEADSCALE_URL}"
+echo ""
+echo "=== 4. Starting Tailscale Client ==="
+if command -v tailscale &>/dev/null; then
+    echo "Connecting to Tailscale network..."
+    sudo tailscale up --login-server "${HEADSCALE_URL}" --accept-routes
+    
+    echo ""
+    echo "Verifying Tailscale connection..."
+    MAX_WAIT=30; ELAPSED=0
+    until tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; do
+        echo -n "."
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+            echo ""
+            echo "Warning: Tailscale did not come online within ${MAX_WAIT}s."
+            echo "Check status with: tailscale status"
+            break
+        fi
+    done
+    
+    if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; then
+        echo ""
+        echo "Connection verified! Tailscale network is active."
+        echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+    fi
+else
+    echo "Tailscale client not installed. Install it and run 02-configure-clients.sh first."
+fi

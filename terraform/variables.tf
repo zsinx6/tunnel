@@ -15,20 +15,7 @@ variable "aws_region" {
   default     = "sa-east-1"
 }
 
-variable "wg_server_private_key" {
-  description = "WireGuard server private key"
+variable "kms_ebs_key_id" {
+  description = "KMS key ID for EBS volume encryption (BYOK)"
   type        = string
-  sensitive   = true
-}
-
-# This single variable now holds ALL peers dynamically
-variable "wg_peers" {
-  description = "Map of all WireGuard peers"
-  type = map(object({
-    public_key = string
-    psk        = string
-    ip         = string
-  }))
-  sensitive = true
-  default   = {}
 }
