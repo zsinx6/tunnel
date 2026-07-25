@@ -9,7 +9,8 @@ set -euo pipefail
 #
 # Ordering matters: SSH access (user + port 50022) is configured FIRST, so any
 # failure in the later steps still leaves an SSH-reachable instance for
-# debugging instead of a bricked one (the security group only allows 50022).
+# debugging instead of a bricked one (the security group does not allow the
+# default port 22 — for SSH it only allows 50022).
 # ==============================================================================
 
 NEW_USER="wgadmin"
