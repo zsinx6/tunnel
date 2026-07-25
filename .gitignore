@@ -9,7 +9,7 @@ crash.log
 crash.*.log
 *.tfvars
 *.tfvars.json
-terraform/peers.auto.tfvars.json
+*.tfplan
 override.tf
 override.tf.json
 *_override.tf

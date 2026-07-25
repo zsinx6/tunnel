@@ -15,20 +15,28 @@ variable "aws_region" {
   default     = "sa-east-1"
 }
 
-variable "wg_server_private_key" {
-  description = "WireGuard server private key"
+variable "kms_ebs_key_id" {
+  description = "KMS key ARN for EBS volume encryption (BYOK). Must be the full ARN: EC2 canonicalizes the value to an ARN in state, so a bare key ID causes a perpetual forces-replacement diff on the instance."
   type        = string
-  sensitive   = true
+
+  validation {
+    condition     = startswith(var.kms_ebs_key_id, "arn:")
+    error_message = "kms_ebs_key_id must be the full key ARN (arn:aws:kms:...). Re-run scripts/00-import-kms-keys.sh — it upgrades an existing kms_keys.auto.tfvars.json in place."
+  }
 }
 
-# This single variable now holds ALL peers dynamically
-variable "wg_peers" {
-  description = "Map of all WireGuard peers"
-  type = map(object({
-    public_key = string
-    psk        = string
-    ip         = string
-  }))
-  sensitive = true
-  default   = {}
+variable "headscale_domain" {
+  description = "Fully-qualified domain name for the Headscale endpoint (e.g. hs.example.com). Must have an A record pointing at the Elastic IP; Caddy obtains a Let's Encrypt certificate for it on the instance."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}$", var.headscale_domain))
+    error_message = "headscale_domain must be a fully-qualified DNS name, e.g. hs.example.com."
+  }
+}
+
+variable "route53_zone_id" {
+  description = "Optional Route53 hosted zone ID. When set, Terraform manages the A record for headscale_domain -> Elastic IP. Leave empty to manage DNS at your own provider."
+  type        = string
+  default     = ""
 }

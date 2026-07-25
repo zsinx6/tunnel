@@ -5,143 +5,201 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 TF_DIR="${SCRIPT_DIR}/../terraform"
-PEERS_JSON="${TF_DIR}/peers.auto.tfvars.json"
+SSH_OPTS=(-i "${SSH_KEY}" -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
-command -v jq &>/dev/null || { echo "Error: 'jq' is required. Run: sudo pacman -S jq"; exit 1; }
+echo "Fetching Terraform outputs..."
+EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip 2>/dev/null) || {
+    echo "Error: could not read wg_elastic_ip output. Did 'terraform apply' succeed?"
+    exit 1
+}
+HEADSCALE_URL=$(terraform -chdir="${TF_DIR}" output -raw headscale_url 2>/dev/null) || {
+    echo "Error: could not read headscale_url output. Did 'terraform apply' succeed?"
+    exit 1
+}
+DOMAIN="${HEADSCALE_URL#https://}"
 
-if [ ! -f "${PEERS_JSON}" ]; then
-    echo "Error: ${PEERS_JSON} not found. Run 01-bootstrap.sh first."
+if ! command -v tailscale &>/dev/null; then
+    echo "Error: Tailscale client not installed. Run 01-bootstrap.sh first."
     exit 1
 fi
 
-if ! jq empty "${PEERS_JSON}" 2>/dev/null; then
-    echo "Error: ${PEERS_JSON} is not valid JSON."
+echo "=== Checking DNS ==="
+RESOLVED=$(getent ahostsv4 "${DOMAIN}" 2>/dev/null | awk '{print $1; exit}' || true)
+if [ -z "${RESOLVED}" ]; then
+    echo "Error: ${DOMAIN} does not resolve yet."
+    echo ""
+    echo "One-time setup — in your registrar's DNS panel, create this record:"
+    echo "  Type:  A"
+    echo "  Name:  ${DOMAIN}   (some panels want only the subdomain part, e.g. '${DOMAIN%%.*}')"
+    echo "  Value: ${EIP}"
+    echo "  TTL:   300 (or the panel's default)"
+    echo ""
+    echo "Wait 1-5 minutes for propagation, verify with:"
+    echo "  dig +short ${DOMAIN}    # must print ${EIP}"
+    echo "then re-run this script."
+    echo "(Alternatively: host DNS in Route53 and set route53_zone_id in terraform.tfvars.)"
+    exit 1
+elif [ "${RESOLVED}" != "${EIP}" ]; then
+    echo "Warning: ${DOMAIN} resolves to ${RESOLVED}, expected ${EIP}."
+    echo "If you just updated DNS this may be caching; TLS will fail until it matches."
+fi
+
+echo "=== Ensuring EC2 is running ==="
+INSTANCE_IDS=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters "Name=tag:Name,Values=${INSTANCE_TAG}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query "Reservations[].Instances[].InstanceId" \
+    --output text)
+COUNT=$(wc -w <<< "${INSTANCE_IDS}")
+if [ "$COUNT" -eq 0 ]; then
+    echo "Error: Could not find an instance tagged '${INSTANCE_TAG}'."
+    exit 1
+elif [ "$COUNT" -gt 1 ]; then
+    echo "Error: found ${COUNT} instances tagged '${INSTANCE_TAG}': ${INSTANCE_IDS}"
+    echo "Refusing to guess. Clean up the duplicates first."
     exit 1
 fi
+INSTANCE_ID="${INSTANCE_IDS}"
 
-if ! jq -e '.wg_peers.desktop' "${PEERS_JSON}" &>/dev/null; then
-    echo "Error: No 'desktop' entry found in ${PEERS_JSON}."
-    exit 1
-fi
+INSTANCE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query "Reservations[0].Instances[0].State.Name" --output text)
+case "$INSTANCE_STATE" in
+    running) ;;
+    pending)
+        echo "Instance is starting. Waiting..."
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    stopping)
+        echo "Instance is stopping. Waiting for it to stop, then restarting..."
+        aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" --region "$REGION"
+        aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    stopped)
+        echo "Starting EC2 instance..."
+        aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+        aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+        ;;
+    *)
+        echo "Error: instance in unexpected state '${INSTANCE_STATE}'."
+        exit 1
+        ;;
+esac
 
-PEER_COUNT=$(jq -r '.wg_peers | keys | length' "${PEERS_JSON}")
-if [ "$PEER_COUNT" -eq 0 ]; then
-    echo "Error: No peers defined in ${PEERS_JSON}."
-    exit 1
-fi
-
-echo "Checking prerequisites..."
-[ -f ~/wireguard-keys/server.pub ] || { echo "Error: Missing server pubkey."; exit 1; }
-
-echo "Fetching Elastic IP from Terraform..."
-EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip)
-
-if [ -z "$EIP" ] || [[ "$EIP" == *"No outputs found"* ]]; then
-    echo "Error: Could not retrieve Elastic IP. Did 'terraform apply' succeed?"
-    exit 1
-fi
-
-PHYS_IF=$(ip route list default | awk '{print $5}' | head -n 1)
-if [ -z "$PHYS_IF" ]; then
-    echo "Error: Could not detect default network interface."
-    exit 1
-fi
-echo "Detected physical interface: ${PHYS_IF}"
-
-echo "=== Configuring Desktop WireGuard (/etc/wireguard/wg0.conf) ==="
-if [ -f /etc/wireguard/wg0.conf ]; then
-    read -r -p "WARNING: /etc/wireguard/wg0.conf already exists. Overwrite it? [y/N] " REPLY
-    REPLY="${REPLY:-n}"
-else
-    REPLY="y"
-fi
-
-if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-    if systemctl is-active --quiet wg-quick@wg0; then
-        echo "Bringing WireGuard interface down..."
-        sudo systemctl stop wg-quick@wg0
-    fi
-
-    sudo mkdir -p /etc/wireguard
-    
-    DESKTOP_IP=$(jq -r '.wg_peers.desktop.ip' "${PEERS_JSON}")
-    if [ -z "$DESKTOP_IP" ] || [ "$DESKTOP_IP" = "null" ]; then
-        echo "Error: Desktop IP not found in ${PEERS_JSON}."
+echo "=== Waiting for Headscale (with valid TLS) ==="
+MAX_WAIT=300; ELAPSED=0
+until curl -fsS --max-time 5 "${HEADSCALE_URL}/health" > /dev/null 2>&1; do
+    echo -n "."
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+        echo ""
+        echo "Error: ${HEADSCALE_URL}/health not ready within ${MAX_WAIT}s."
+        echo "On first boot this can mean the Let's Encrypt certificate is not"
+        echo "issued yet (DNS must point at ${EIP}). Diagnose with:"
+        echo "  ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} sudo tunnel-logs"
         exit 1
     fi
-    
-    if [ ! -f ~/wireguard-keys/desktop.key ]; then
-        echo "Error: ~/wireguard-keys/desktop.key not found."
-        exit 1
-    fi
-    
-    DESKTOP_KEY=$(cat ~/wireguard-keys/desktop.key)
-    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
-    DESKTOP_PSK=$(cat ~/wireguard-keys/desktop.psk)
-    
-    sudo bash -c "cat <<WGEOF > /etc/wireguard/wg0.conf
-[Interface]
-PrivateKey = ${DESKTOP_KEY}
-Address = ${DESKTOP_IP}/24
-
-PostUp   = iptables -I FORWARD -i wg0 -o ${PHYS_IF} -j DROP
-PostDown = iptables -D FORWARD -i wg0 -o ${PHYS_IF} -j DROP
-
-[Peer]
-PublicKey    = ${SERVER_PUB}
-PresharedKey = ${DESKTOP_PSK}
-Endpoint     = ${EIP}:51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 30
-WGEOF"
-    sudo chmod 600 /etc/wireguard/wg0.conf
-    echo "Desktop configured securely."
-fi
-
-echo "=== Generating Mobile Configurations ==="
-
-MOBILE_CLIENTS=$(jq -r '.wg_peers | to_entries[] | select(.key != "desktop") | .key' "${PEERS_JSON}")
-
-if [ -z "$MOBILE_CLIENTS" ]; then
-    echo "No mobile clients found in ${PEERS_JSON}."
-    exit 0
-fi
-
-for client in $MOBILE_CLIENTS; do
-    CLIENT_IP=$(jq -r ".wg_peers.${client}.ip" "${PEERS_JSON}")
-    
-    if [ -z "$CLIENT_IP" ] || [ "$CLIENT_IP" = "null" ]; then
-        echo "Warning: No IP found for ${client} in ${PEERS_JSON}, skipping."
-        continue
-    fi
-    
-    if [ ! -f ~/wireguard-keys/${client}.key ]; then
-        echo "Warning: Key file for ${client} not found, skipping."
-        continue
-    fi
-    
-    echo ""
-    echo "--------------------------------------------------------"
-    echo " Scan this QR code with your ${client^}'s WireGuard app:"
-    echo "--------------------------------------------------------"
-    echo ""
-    
-    CLIENT_KEY=$(cat ~/wireguard-keys/${client}.key)
-    SERVER_PUB=$(cat ~/wireguard-keys/server.pub)
-    CLIENT_PSK=$(cat ~/wireguard-keys/${client}.psk)
-    
-    qrencode -t ansiutf8 <<QREOF
-[Interface]
-PrivateKey = ${CLIENT_KEY}
-Address = ${CLIENT_IP}/24
-
-[Peer]
-PublicKey    = ${SERVER_PUB}
-PresharedKey = ${CLIENT_PSK}
-Endpoint     = ${EIP}:51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 25
-QREOF
-    
-    read -r -p "Press [Enter] to continue to the next device..."
 done
+echo ""
+echo "Headscale is ready at ${HEADSCALE_URL}"
+
+echo "=== Checking existing registration ==="
+if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/null 2>&1; then
+    CONTROL_URL=$(tailscale debug prefs 2>/dev/null | jq -r '.ControlURL // empty' || true)
+    if [ "${CONTROL_URL%/}" = "${HEADSCALE_URL%/}" ]; then
+        echo "Desktop is already registered with ${HEADSCALE_URL} and online."
+        exit 0
+    fi
+    echo "Warning: this machine is online against a DIFFERENT control server:"
+    echo "  ${CONTROL_URL:-unknown}"
+    echo "Refusing to switch it silently. To move it to ${HEADSCALE_URL}, run:"
+    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --accept-routes --force-reauth"
+    exit 1
+fi
+
+echo "=== Generating one-time auth key ==="
+SSH_ERR=$(mktemp)
+trap 'rm -f "${SSH_ERR}"' EXIT
+
+USERS_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale users list --output json" 2>"${SSH_ERR}") || {
+    echo "Error: SSH to the instance failed:"
+    cat "${SSH_ERR}"
+    echo "If the instance was re-provisioned, clear the old host key first:"
+    echo "  ssh-keygen -R '[${EIP}]:${SSH_PORT}'"
+    exit 1
+}
+USER_ID=$(echo "${USERS_JSON}" | jq -r '.[] | select(.name == "default") | .id // empty')
+if [ -z "${USER_ID}" ]; then
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" "sudo headscale users create default" 2>"${SSH_ERR}" || {
+        echo "Error: could not create Headscale user 'default':"
+        cat "${SSH_ERR}"
+        exit 1
+    }
+    USER_ID=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+        "sudo headscale users list --output json" 2>"${SSH_ERR}" \
+        | jq -r '.[] | select(.name == "default") | .id // empty') || {
+        echo "Error: could not list Headscale users after creating 'default':"
+        cat "${SSH_ERR}"
+        exit 1
+    }
+    if [ -z "${USER_ID}" ]; then
+        echo "Error: Headscale user 'default' still not found after creation."
+        exit 1
+    fi
+fi
+
+# One-time, short-lived key: harmless in shell history / process listings
+# after its single use or 15-minute expiry.
+KEY_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale preauthkeys create --user ${USER_ID} --expiration 15m --output json" 2>"${SSH_ERR}") || {
+    echo "Error: failed to generate auth key:"
+    cat "${SSH_ERR}"
+    exit 1
+}
+AUTH_KEY=$(echo "${KEY_JSON}" | jq -r '.key // empty')
+if [ -z "${AUTH_KEY}" ]; then
+    echo "Error: could not parse auth key from Headscale response."
+    exit 1
+fi
+echo "Auth key generated (single-use, expires in 15 minutes)."
+
+echo "=== Registering desktop with Headscale ==="
+KEY_FILE=$(mktemp)
+trap 'rm -f "${SSH_ERR}" "${KEY_FILE}"' EXIT
+chmod 600 "${KEY_FILE}"
+printf '%s' "${AUTH_KEY}" > "${KEY_FILE}"
+
+sudo tailscale up \
+    --login-server "${HEADSCALE_URL}" \
+    --auth-key "file:${KEY_FILE}" \
+    --accept-routes \
+    --timeout 60s
+rm -f "${KEY_FILE}"
+
+echo ""
+echo "Desktop registered successfully."
+echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+
+echo ""
+echo "=== Mobile Devices ==="
+echo ""
+echo "The official Tailscale app supports custom coordination servers:"
+echo ""
+echo "  Android: Settings -> Accounts menu -> 'Use an alternate server'"
+echo "  iOS:     Settings -> Alternate Coordination Server URL"
+echo ""
+echo "  1. Enter: ${HEADSCALE_URL}"
+echo "  2. Tap Sign In — a browser page opens showing a registration command,"
+echo "     e.g. on Headscale 0.29:"
+echo "       headscale auth register --auth-id hskey-authreq-... --user USERNAME"
+echo "  3. Run it on the server via SSH, with sudo and USERNAME replaced by 'default':"
+echo "     ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} \\"
+echo "       \"sudo headscale auth register --auth-id hskey-authreq-... --user default\""
+echo ""
+echo "Alternative (Android): skip the browser flow — generate a key with"
+echo "scripts/add-device.sh and use the app's 'Use auth key' sign-in option."
+echo ""
+echo "No certificate installation is needed — the server uses a publicly"
+echo "trusted Let's Encrypt certificate."

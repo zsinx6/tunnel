@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+source "${SCRIPT_DIR}/config.sh"
+TF_DIR="${SCRIPT_DIR}/../terraform"
+
 echo "=== 1. Installing Local Dependencies ==="
 MISSING_PKGS=()
-command -v wg      &>/dev/null || MISSING_PKGS+=(wireguard-tools)
-command -v aws     &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
-command -v qrencode &>/dev/null || MISSING_PKGS+=(qrencode)
-command -v terraform &>/dev/null || MISSING_PKGS+=(terraform)
-command -v jq      &>/dev/null || MISSING_PKGS+=(jq)
+command -v aws         &>/dev/null || MISSING_PKGS+=(aws-cli-v2)
+command -v terraform   &>/dev/null || MISSING_PKGS+=(terraform)
+command -v jq          &>/dev/null || MISSING_PKGS+=(jq)
+command -v openssl     &>/dev/null || MISSING_PKGS+=(openssl)
+command -v tailscale   &>/dev/null || MISSING_PKGS+=(tailscale)
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing packages: ${MISSING_PKGS[*]}"
-    sudo pacman -S --needed --noconfirm "${MISSING_PKGS[@]}"
+    sudo pacman -S --needed --noconfirm "${MISSING_PKGS[@]}" || {
+        echo "Error: pacman install failed. If 'terraform' is unavailable in the"
+        echo "official repos, install it from the AUR (or use OpenTofu) and re-run."
+        exit 1
+    }
 else
     echo "All dependencies already installed. Skipping."
 fi
+
+sudo systemctl enable --now tailscaled
 
 AWS_VERSION=$(aws --version 2>&1 | grep -oP 'aws-cli/\K[0-9]+' || echo "0")
 if [ "$AWS_VERSION" -lt 2 ]; then
@@ -22,93 +32,98 @@ if [ "$AWS_VERSION" -lt 2 ]; then
     exit 1
 fi
 
-echo "=== 2. Generating Dedicated SSH Key ==="
-SSH_KEY_PATH="$HOME/.ssh/wg_ec2_ed25519"
+echo "=== 2. Importing BYOK KMS Key for EBS ==="
+bash "${SCRIPT_DIR}/00-import-kms-keys.sh"
 
-if [ ! -f "${SSH_KEY_PATH}.pub" ]; then
+echo "=== 3. Generating Dedicated SSH Key ==="
+if [ ! -f "${SSH_KEY}.pub" ]; then
     echo "Generating dedicated ED25519 SSH key for the bastion."
-    ssh-keygen -t ed25519 -f "${SSH_KEY_PATH}" -C "wg-ec2-operator"
+    ssh-keygen -t ed25519 -f "${SSH_KEY}" -C "wg-ec2-operator"
 else
-    echo "Dedicated SSH key already exists at ${SSH_KEY_PATH}. Skipping."
+    echo "Dedicated SSH key already exists at ${SSH_KEY}. Skipping."
 fi
 
-echo "=== 3. Configuring Local SSH Alias ==="
-mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/config && chmod 600 ~/.ssh/config
-if ! grep -q "Host wg-bastion" ~/.ssh/config; then
-cat <<EOF >> ~/.ssh/config
-
-Host wg-bastion
-    HostName 10.10.0.1
-    User wgadmin
-    Port 50022
-    IdentityFile ${SSH_KEY_PATH}
-EOF
-    echo "Added 'wg-bastion' alias to ~/.ssh/config."
+echo "=== 4. Writing Terraform Variables ==="
+KMS_KEYS_FILE="${TF_DIR}/kms_keys.auto.tfvars.json"
+if [ ! -f "${KMS_KEYS_FILE}" ]; then
+    echo "Error: ${KMS_KEYS_FILE} not found. Run 00-import-kms-keys.sh first."
+    exit 1
 fi
 
-echo "=== 4. Generating Server WireGuard Cryptography ==="
-mkdir -p ~/wireguard-keys && chmod 700 ~/wireguard-keys && cd ~/wireguard-keys
-
-umask 077
-if [ ! -f "server.key" ]; then
-    wg genkey > server.key  && wg pubkey < server.key  > server.pub
-    echo "Server WireGuard keys generated."
-else
-    echo "Server WireGuard keys already exist. Skipping."
+EBS_KEY_ID=$(jq -r '.kms_ebs_key_id // empty' "${KMS_KEYS_FILE}")
+if [ -z "${EBS_KEY_ID}" ]; then
+    echo "Error: ${KMS_KEYS_FILE} does not contain kms_ebs_key_id."
+    exit 1
 fi
 
-echo "=== 5. Generating Default Peer Keys ==="
-DEFAULT_PEERS=("desktop" "tablet" "smartphone")
-for peer in "${DEFAULT_PEERS[@]}"; do
-    if [ ! -f "${peer}.key" ]; then
-        wg genkey > "${peer}.key" && wg pubkey < "${peer}.key" > "${peer}.pub"
-        wg genpsk > "${peer}.psk"
-        echo "Generated keys for ${peer}."
-    else
-        echo "Keys for ${peer} already exist. Skipping."
-    fi
-done
-
-echo "=== 6. Creating Initial Peers Configuration ==="
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-TF_DIR="${SCRIPT_DIR}/../terraform"
-PEERS_JSON="${TF_DIR}/peers.auto.tfvars.json"
-
-if [ ! -f "${PEERS_JSON}" ]; then
-    if ! jq -n \
-      --arg desktop_pub "$(cat desktop.pub)" \
-      --arg desktop_psk "$(cat desktop.psk)" \
-      --arg tablet_pub "$(cat tablet.pub)" \
-      --arg tablet_psk "$(cat tablet.psk)" \
-      --arg smartphone_pub "$(cat smartphone.pub)" \
-      --arg smartphone_psk "$(cat smartphone.psk)" \
-      '{
-        "wg_peers": {
-          "desktop": {"public_key": $desktop_pub, "psk": $desktop_psk, "ip": "10.10.0.2"},
-          "tablet": {"public_key": $tablet_pub, "psk": $tablet_psk, "ip": "10.10.0.3"},
-          "smartphone": {"public_key": $smartphone_pub, "psk": $smartphone_psk, "ip": "10.10.0.4"}
-        }
-      }' > "${PEERS_JSON}.tmp"; then
-        echo "Error: Failed to create ${PEERS_JSON}. Check that all key files are valid."
-        rm -f "${PEERS_JSON}.tmp"
+prompt_domain() {
+    echo ""
+    echo "The relay needs a DNS name: Caddy uses it to get a Let's Encrypt TLS"
+    echo "certificate, and all Tailscale clients connect to it."
+    echo ""
+    echo "Pick a subdomain of a domain you own — e.g. for zsinx6.dev, use:"
+    echo "  hs.zsinx6.dev"
+    echo ""
+    echo "You do NOT need to change nameservers or move DNS providers. After"
+    echo "'terraform apply' you will create ONE A record at your registrar"
+    echo "(the exact record is printed by: terraform output dns_setup)."
+    echo ""
+    read -r -p "Headscale domain: " HEADSCALE_DOMAIN
+    # Normalize common paste mistakes, then mirror the Terraform validation
+    # so bad input fails here instead of at 'terraform apply'.
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN,,}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN#https://}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN%/}"
+    HEADSCALE_DOMAIN="${HEADSCALE_DOMAIN%.}"
+    if ! [[ "${HEADSCALE_DOMAIN}" =~ ^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$ ]]; then
+        echo "Error: '${HEADSCALE_DOMAIN}' is not a valid DNS name (expected e.g. hs.zsinx6.dev)."
         exit 1
     fi
-    mv "${PEERS_JSON}.tmp" "${PEERS_JSON}"
-    chmod 600 "${PEERS_JSON}"
-    echo "peers.auto.tfvars.json created with default peers."
-else
-    echo "peers.auto.tfvars.json already exists. Skipping."
-fi
+}
 
-echo "=== 7. Writing Base Terraform Variables ==="
 TFVARS="${TF_DIR}/terraform.tfvars"
 if [ ! -f "${TFVARS}" ]; then
+    prompt_domain
     cat <<EOF > "$TFVARS"
-ssh_public_key        = "$(cat ${SSH_KEY_PATH}.pub)"
-wg_server_private_key = "$(cat server.key)"
+ssh_public_key   = "$(cat "${SSH_KEY}.pub")"
+kms_ebs_key_id   = "${EBS_KEY_ID}"
+headscale_domain = "${HEADSCALE_DOMAIN}"
 EOF
     chmod 600 "$TFVARS"
-    echo "terraform.tfvars written with base server configurations."
+    echo "terraform.tfvars written."
 else
-    echo "terraform.tfvars already exists. Skipping."
+    # Existing tfvars (possibly from an older deployment): ensure every
+    # variable this branch requires is present, without clobbering the rest.
+    UPDATED=false
+    if ! grep -q '^kms_ebs_key_id' "${TFVARS}"; then
+        printf 'kms_ebs_key_id   = "%s"\n' "${EBS_KEY_ID}" >> "${TFVARS}"
+        echo "kms_ebs_key_id added to terraform.tfvars."
+        UPDATED=true
+    fi
+    if ! grep -q '^headscale_domain' "${TFVARS}"; then
+        prompt_domain
+        printf 'headscale_domain = "%s"\n' "${HEADSCALE_DOMAIN}" >> "${TFVARS}"
+        echo "headscale_domain added to terraform.tfvars."
+        UPDATED=true
+    fi
+    chmod 600 "$TFVARS"
+    if grep -qE '^(wg_server_private_key|wg_peers)' "${TFVARS}"; then
+        echo ""
+        echo "WARNING: terraform.tfvars still contains WireGuard-era entries"
+        echo "(wg_server_private_key and/or wg_peers) from the old design. They"
+        echo "keep a private key on disk and cause Terraform warnings."
+        echo "Run the migration helper to retire them safely:"
+        echo "  bash scripts/migrate-from-main.sh"
+    fi
+    if [ "$UPDATED" = false ]; then
+        echo "terraform.tfvars already up to date. Skipping."
+    fi
 fi
+
+echo ""
+echo "Bootstrap complete."
+echo "Next steps:"
+echo "  1. cd terraform && terraform init && terraform apply"
+echo "  2. Point the DNS A record for your domain at the Elastic IP"
+echo "     (terraform output wg_elastic_ip) — skip if you set route53_zone_id."
+echo "  3. bash scripts/02-configure-clients.sh"

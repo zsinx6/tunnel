@@ -1,106 +1,88 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ -z "${1:-}" ]; then
-    echo "Usage: $0 <device_name>"
-    echo "Example: $0 laptop"
-    exit 1
-fi
-
-DEVICE="${1,,}"
-if [[ ! "$DEVICE" =~ ^[a-z0-9-]+$ ]]; then
-    echo "Error: Device name must contain only lowercase letters, numbers, and hyphens."
-    exit 1
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-PEERS_JSON="${SCRIPT_DIR}/../terraform/peers.auto.tfvars.json"
-KEYS_DIR="$HOME/wireguard-keys"
+source "${SCRIPT_DIR}/config.sh"
 
-command -v jq &>/dev/null || { echo "Error: 'jq' is required. Run: sudo pacman -S jq"; exit 1; }
-command -v qrencode &>/dev/null || { echo "Error: 'qrencode' is required. Run: sudo pacman -S qrencode"; exit 1; }
+TF_DIR="${SCRIPT_DIR}/../terraform"
+SSH_OPTS=(-i "${SSH_KEY}" -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
-mkdir -p "${KEYS_DIR}"
-cd "${KEYS_DIR}"
-
-cleanup() {
-    if [ -f "${KEYS_DIR}/tmp.json" ]; then
-        rm -f "${KEYS_DIR}/tmp.json"
-    fi
+echo "Fetching Terraform outputs..."
+EIP=$(terraform -chdir="${TF_DIR}" output -raw wg_elastic_ip 2>/dev/null) || {
+    echo "Error: could not read wg_elastic_ip output. Did 'terraform apply' succeed?"
+    exit 1
 }
-trap cleanup EXIT
+HEADSCALE_URL=$(terraform -chdir="${TF_DIR}" output -raw headscale_url 2>/dev/null) || {
+    echo "Error: could not read headscale_url output. Did 'terraform apply' succeed?"
+    exit 1
+}
 
-if [ -f "${DEVICE}.key" ]; then
-    echo "Error: Keys for '${DEVICE}' already exist in ${KEYS_DIR}."
+echo "=== Adding a New Device ==="
+echo ""
+if ! curl -fsS --max-time 5 "${HEADSCALE_URL}/health" > /dev/null 2>&1; then
+    echo "Headscale is not reachable at ${HEADSCALE_URL}."
+    echo "Start the tunnel first:"
+    echo "  bash scripts/vpn-up.sh"
+    exit 1
+fi
+echo "Headscale is up at ${HEADSCALE_URL}."
+
+echo ""
+echo "Generating one-time auth key via SSH..."
+SSH_ERR=$(mktemp)
+trap 'rm -f "${SSH_ERR}"' EXIT
+
+USER_ID=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale users list --output json" 2>"${SSH_ERR}" \
+    | jq -r '.[] | select(.name == "default") | .id // empty') || {
+    echo "Error: SSH to the instance failed:"
+    cat "${SSH_ERR}"
+    echo "If the instance was re-provisioned, clear the old host key first:"
+    echo "  ssh-keygen -R '[${EIP}]:${SSH_PORT}'"
+    exit 1
+}
+if [ -z "${USER_ID}" ]; then
+    echo "Error: Headscale user 'default' not found on the server."
     exit 1
 fi
 
-if [ -f "${PEERS_JSON}" ]; then
-    if ! jq empty "${PEERS_JSON}" 2>/dev/null; then
-        echo "Error: ${PEERS_JSON} is not valid JSON. Please fix it before adding a device."
-        exit 1
-    fi
-    
-    if jq -e ".wg_peers[\"${DEVICE}\"]" "${PEERS_JSON}" > /dev/null; then
-        echo "Error: Device '${DEVICE}' already exists in ${PEERS_JSON}."
-        exit 1
-    fi
-fi
-
-echo "=== Generating Keys for ${DEVICE} ==="
-umask 077
-wg genkey > "${DEVICE}.key" && wg pubkey < "${DEVICE}.key" > "${DEVICE}.pub"
-wg genpsk > "${DEVICE}.psk"
-
-PUB_KEY=$(cat "${DEVICE}.pub")
-PSK_KEY=$(cat "${DEVICE}.psk")
-
-echo "=== Updating Terraform Peers State ==="
-if [ ! -f "${PEERS_JSON}" ] || [ ! -s "${PEERS_JSON}" ]; then
-    echo '{"wg_peers": {}}' > "${PEERS_JSON}"
-fi
-
-LAST_OCTET=$(jq -r 'if (.wg_peers | length) == 0 then 1 else [.wg_peers[].ip | split(".")[3] | tonumber] | max end' "${PEERS_JSON}")
-NEXT_OCTET=$((LAST_OCTET + 1))
-
-if [ "$NEXT_OCTET" -gt 254 ]; then
-    echo "Error: No available IPs in 10.10.0.0/24 subnet (max 252 peers)."
-    rm -f "${DEVICE}.key" "${DEVICE}.pub" "${DEVICE}.psk"
+KEY_JSON=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
+    "sudo headscale preauthkeys create --user ${USER_ID} --expiration 15m --output json" 2>"${SSH_ERR}") || {
+    echo "Error: failed to generate auth key:"
+    cat "${SSH_ERR}"
+    exit 1
+}
+AUTH_KEY=$(echo "${KEY_JSON}" | jq -r '.key // empty')
+if [ -z "${AUTH_KEY}" ]; then
+    echo "Error: could not parse auth key from Headscale response."
     exit 1
 fi
 
-if jq -e --arg ip "10.10.0.${NEXT_OCTET}" '.wg_peers[] | select(.ip == $ip)' "${PEERS_JSON}" > /dev/null 2>&1; then
-    echo "Error: IP 10.10.0.${NEXT_OCTET} is already in use. Check ${PEERS_JSON} for conflicts."
-    rm -f "${DEVICE}.key" "${DEVICE}.pub" "${DEVICE}.psk"
-    exit 1
-fi
-
-NEW_IP="10.10.0.${NEXT_OCTET}"
-
-umask 077
-jq --arg dev "$DEVICE" \
-   --arg pub "$PUB_KEY" \
-   --arg psk "$PSK_KEY" \
-   --arg ip "$NEW_IP" \
-   '.wg_peers[$dev] = {"public_key": $pub, "psk": $psk, "ip": $ip}' "${PEERS_JSON}" > tmp.json && mv tmp.json "${PEERS_JSON}"
-
-echo "Successfully added ${DEVICE} with IP ${NEW_IP} to ${PEERS_JSON}."
 echo ""
-echo "=== NEXT STEPS ==="
-echo "1. cd terraform && terraform apply"
-echo "2. Generate your QR code by running this exact command:"
+echo "Auth key generated (single-use, expires in 15 minutes)."
 echo ""
-
-cat << EOF
-bash -c 'echo "[Interface]
-PrivateKey = \$(cat ~/wireguard-keys/${DEVICE}.key)
-Address = ${NEW_IP}/24
-
-[Peer]
-PublicKey    = \$(cat ~/wireguard-keys/server.pub)
-PresharedKey = \$(cat ~/wireguard-keys/${DEVICE}.psk)
-Endpoint     = \$(terraform -chdir=${SCRIPT_DIR}/../terraform output -raw wg_elastic_ip):51920
-AllowedIPs   = 10.10.0.0/24
-PersistentKeepalive = 25" | qrencode -t ansiutf8'
-EOF
+echo "=== Linux / desktop device ==="
 echo ""
+echo "On the new device, run (key is one-time and expires in 15 min, so it is"
+echo "harmless in shell history afterwards):"
+echo ""
+echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --auth-key ${AUTH_KEY} --accept-routes"
+echo ""
+echo "=== Mobile device (official Tailscale app) ==="
+echo ""
+echo "  Android: Settings -> Accounts menu -> 'Use an alternate server'"
+echo "  iOS:     Settings -> Alternate Coordination Server URL"
+echo ""
+echo "  Option A (Android): sign-in screen -> menu -> 'Use auth key' -> paste"
+echo "  the key printed above. Done — no server command needed."
+echo ""
+echo "  Option B (browser flow):"
+echo "  1. Enter: ${HEADSCALE_URL}"
+echo "  2. Tap Sign In — a browser page opens showing a registration command,"
+echo "     e.g. on Headscale 0.29:"
+echo "       headscale auth register --auth-id hskey-authreq-... --user USERNAME"
+echo "  3. Run it on the server via SSH, with sudo and USERNAME replaced by 'default':"
+echo "     ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} \\"
+echo "       \"sudo headscale auth register --auth-id hskey-authreq-... --user default\""
+echo ""
+echo "The device will get an IP in the 100.64.0.0/10 range."
