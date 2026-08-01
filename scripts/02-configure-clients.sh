@@ -114,7 +114,11 @@ if tailscale status --json 2>/dev/null | jq -e '.Self.Online == true' > /dev/nul
     echo "Warning: this machine is online against a DIFFERENT control server:"
     echo "  ${CONTROL_URL:-unknown}"
     echo "Refusing to switch it silently. To move it to ${HEADSCALE_URL}, run:"
-    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --accept-routes --force-reauth"
+    ADVERTISE_HINT=""
+    if [ -n "${LAN_SERVICES_ROUTE}" ]; then
+        ADVERTISE_HINT=" --advertise-routes ${LAN_SERVICES_ROUTE}"
+    fi
+    echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --accept-routes${ADVERTISE_HINT} --force-reauth"
     exit 1
 fi
 
@@ -171,16 +175,39 @@ trap 'rm -f "${SSH_ERR}" "${KEY_FILE}"' EXIT
 chmod 600 "${KEY_FILE}"
 printf '%s' "${AUTH_KEY}" > "${KEY_FILE}"
 
-sudo tailscale up \
-    --login-server "${HEADSCALE_URL}" \
-    --auth-key "file:${KEY_FILE}" \
-    --accept-routes \
+# When a LAN host is exposed (config.local.sh), --advertise-routes must repeat
+# the route: 'tailscale up' rejects a call that omits a non-default
+# preference. Harmless before the route is approved (03-lan-services.sh).
+TS_UP_ARGS=(
+    --login-server "${HEADSCALE_URL}"
+    --auth-key "file:${KEY_FILE}"
+    --accept-routes
     --timeout 60s
+)
+if [ -n "${LAN_SERVICES_ROUTE}" ]; then
+    TS_UP_ARGS+=(--advertise-routes "${LAN_SERVICES_ROUTE}")
+else
+    # Clear any route an earlier run stored, so 'tailscale up' does not refuse
+    # to drop an unmentioned preference (same guard as vpn-up.sh).
+    STALE_ROUTES=$(tailscale debug prefs 2>/dev/null \
+        | jq -r '.AdvertiseRoutes // [] | join(",")' 2>/dev/null || true)
+    if [ -n "${STALE_ROUTES}" ]; then
+        echo "Clearing a stale advertised route (${STALE_ROUTES})..."
+        sudo tailscale set --advertise-routes= || true
+    fi
+fi
+sudo tailscale up "${TS_UP_ARGS[@]}"
 rm -f "${KEY_FILE}"
 
 echo ""
 echo "Desktop registered successfully."
 echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+if [ -n "${LAN_SERVICES_HOST}" ]; then
+    echo ""
+    echo "Registration created a new Headscale node, so the home-services route"
+    echo "needs (re-)approval. If you use it, run:"
+    echo "  bash scripts/03-lan-services.sh"
+fi
 
 echo ""
 echo "=== Mobile Devices ==="

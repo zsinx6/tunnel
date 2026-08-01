@@ -1,6 +1,9 @@
 .env
 .env.local
 
+# Machine-specific script overrides (LAN host to expose, service cheat sheet)
+scripts/config.local.sh
+
 # Terraform-specific files
 **/.terraform/*
 *.tfstate

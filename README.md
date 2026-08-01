@@ -166,6 +166,14 @@ This will:
 - Refuse to silently switch the machine if it is already registered against a different control server
 - Print instructions for mobile devices
 
+### Step 7 — (Optional) Expose a home LAN host
+
+```bash
+bash scripts/03-lan-services.sh
+```
+
+Makes one LAN machine (e.g. a NAS or Docker host with self-hosted services) reachable from all tailnet devices while away from home. Requires `scripts/config.local.sh` — see [Accessing Home Services](#accessing-home-services). Re-run it whenever the desktop re-registers or you change `LAN_SERVICES_HOST` (the approval is stored per node in Headscale).
+
 ---
 
 ## Daily Usage
@@ -207,12 +215,14 @@ This checks that Headscale is reachable, generates a **single-use, 15-minute** a
 
 ---
 
-## Accessing Home Services (e.g., Jellyfin)
+## Accessing Home Services
+
+### Services on a tailnet device
 
 Once registered, all Tailscale devices can access each other directly:
 
 ```
-# From tablet, access Jellyfin on desktop:
+# From tablet, access a service running on the desktop itself:
 curl http://<desktop-tailscale-ip>:8096
 
 # Or use the MagicDNS hostname (enabled; base domain ts.internal):
@@ -220,6 +230,41 @@ curl http://desktop:8096
 ```
 
 When at home, devices are on the same LAN — no relay needed. When away, traffic goes through the encrypted DERP relay on EC2.
+
+### Services on a separate LAN host (subnet route)
+
+Self-hosted services often run on a LAN machine that is **not** a tailnet node (a NAS, a Docker host, ...). The desktop can act as a subnet router for that single host:
+
+```
+Tablet (away) ── tailnet ──> Desktop (home) ── LAN ──> LAN host (services)
+```
+
+Create `scripts/config.local.sh` (gitignored, machine-specific) with the host to expose:
+
+```bash
+LAN_SERVICES_HOST="192.168.1.42"        # the LAN host to expose
+LAN_SERVICES_PROBE_PORT="8096"          # optional: TCP port for a reachability check
+LAN_SERVICES=(                          # optional: cheat sheet printed by vpn-up.sh
+    "Jellyfin  http://${LAN_SERVICES_HOST}:8096"
+)
+```
+
+Then, one-time on the desktop, with the tunnel up:
+
+```bash
+bash scripts/03-lan-services.sh
+```
+
+This enables IPv4 forwarding on the desktop, advertises `<LAN_SERVICES_HOST>/32`, and approves the route in Headscale. After that, any tailnet device uses the same `IP:port` addresses as at home.
+
+Notes:
+
+- The desktop must be on and connected (`vpn-up.sh`) for the route to work — it is the router.
+- The route covers the whole host, so every port on it is reachable.
+- Linux clients need `--accept-routes` (all scripts here already pass it). The Tailscale mobile apps use subnet routes by default; on Android, check "Use Tailscale subnets" if it does not work.
+- MagicDNS names cover only tailnet nodes, so use the IP for these services.
+- The route approval is stored per node in the Headscale database — re-run `03-lan-services.sh` after the desktop re-registers, the instance is re-provisioned, or you change `LAN_SERVICES_HOST`.
+- To stop exposing the host, remove `LAN_SERVICES_HOST` from `config.local.sh` (or delete the file). The next `vpn-up.sh` clears the advertised route automatically.
 
 ---
 
@@ -290,6 +335,7 @@ It rebuilds the state with `terraform import` against a throwaway git worktree o
 Replacing the EC2 instance (changing `user_data`, or `terraform destroy`/`apply`) wipes the Headscale database and host keys:
 
 - **All devices must re-register** (`02-configure-clients.sh` / `add-device.sh`).
+- **A LAN-host subnet route loses its approval** — if you use one, run `03-lan-services.sh` again after re-registering the desktop.
 - **SSH host keys change** — run `ssh-keygen -R '[<EIP>]:50022'` before reconnecting.
 - The AMI is intentionally **not** tracked (`ignore_changes = [ami]`), so a new upstream Debian AMI release does not force a surprise replacement. Side effect: a replacement re-creates the instance with the AMI recorded in state; if Debian has deregistered that AMI by then, the apply fails — temporarily remove `ignore_changes = [ami]` to pick up the current AMI and re-apply.
 - The Let's Encrypt certificate is re-issued automatically on the new instance (same domain).
@@ -335,9 +381,11 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 .
 ├── scripts/
 │   ├── config.sh                  # Shared configuration (region, SSH user/port/key, instance tag)
+│   ├── config.local.sh            # Machine-specific overrides (LAN host to expose) — gitignored
 │   ├── 00-import-kms-keys.sh      # BYOK: generate local key material, import into AWS KMS
 │   ├── 01-bootstrap.sh            # Local setup: packages, KMS keys, SSH key, tfvars (incl. domain)
 │   ├── 02-configure-clients.sh    # Register the desktop with Headscale
+│   ├── 03-lan-services.sh         # Expose a LAN host to the tailnet via a subnet route
 │   ├── add-device.sh              # Generate one-time auth keys for new devices
 │   ├── migrate-from-main.sh       # One-time migration from the WireGuard design
 │   ├── destroy-old-main-infra.sh  # Lost-state recovery: import + destroy the old design

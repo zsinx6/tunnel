@@ -113,7 +113,24 @@ fi
 echo "Connecting to Tailscale network..."
 # --timeout prevents an indefinite hang if the node key has expired (Headscale
 # default: 180 days) and interactive re-auth would be required.
-if ! sudo tailscale up --login-server "${HEADSCALE_URL}" --accept-routes --timeout 30s; then
+# When a LAN host is exposed (config.local.sh), --advertise-routes must repeat
+# the route: 'tailscale up' rejects a call that omits a non-default
+# preference. Harmless before the route is approved (03-lan-services.sh).
+TS_UP_ARGS=(--login-server "${HEADSCALE_URL}" --accept-routes --timeout 30s)
+if [ -n "${LAN_SERVICES_ROUTE}" ]; then
+    TS_UP_ARGS+=(--advertise-routes "${LAN_SERVICES_ROUTE}")
+else
+    # No LAN route is configured now. If an earlier run stored one, 'tailscale
+    # up' refuses to drop that preference unless the command repeats it. Clear
+    # the leftover first, so this call does not fail after the instance started.
+    STALE_ROUTES=$(tailscale debug prefs 2>/dev/null \
+        | jq -r '.AdvertiseRoutes // [] | join(",")' 2>/dev/null || true)
+    if [ -n "${STALE_ROUTES}" ]; then
+        echo "Clearing a stale advertised route (${STALE_ROUTES})..."
+        sudo tailscale set --advertise-routes= || true
+    fi
+fi
+if ! sudo tailscale up "${TS_UP_ARGS[@]}"; then
     echo ""
     echo "Error: 'tailscale up' failed. If the node key expired, re-register:"
     echo "  bash scripts/02-configure-clients.sh"
@@ -138,3 +155,9 @@ done
 echo ""
 echo "Connection verified! Tailscale network is active."
 echo "Your Tailscale IP: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+
+if [ -n "${LAN_SERVICES_HOST}" ]; then
+    echo ""
+    print_lan_services
+    echo "(If not set up yet, enable remote access with: bash scripts/03-lan-services.sh)"
+fi
