@@ -12,6 +12,7 @@ command -v terraform   &>/dev/null || MISSING_PKGS+=(terraform)
 command -v jq          &>/dev/null || MISSING_PKGS+=(jq)
 command -v openssl     &>/dev/null || MISSING_PKGS+=(openssl)
 command -v tailscale   &>/dev/null || MISSING_PKGS+=(tailscale)
+command -v ethtool     &>/dev/null || MISSING_PKGS+=(ethtool)
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing packages: ${MISSING_PKGS[*]}"
@@ -107,14 +108,6 @@ else
         UPDATED=true
     fi
     chmod 600 "$TFVARS"
-    if grep -qE '^(wg_server_private_key|wg_peers)' "${TFVARS}"; then
-        echo ""
-        echo "WARNING: terraform.tfvars still contains WireGuard-era entries"
-        echo "(wg_server_private_key and/or wg_peers) from the old design. They"
-        echo "keep a private key on disk and cause Terraform warnings."
-        echo "Run the migration helper to retire them safely:"
-        echo "  bash scripts/migrate-from-main.sh"
-    fi
     if [ "$UPDATED" = false ]; then
         echo "terraform.tfvars already up to date. Skipping."
     fi

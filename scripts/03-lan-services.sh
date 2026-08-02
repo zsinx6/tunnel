@@ -8,8 +8,9 @@ set -euo pipefail
 # (set LAN_SERVICES_HOST in scripts/config.local.sh). This script turns the
 # desktop into a subnet router for that single host:
 #   1. enables IPv4 forwarding on the desktop (persistent)
-#   2. advertises LAN_SERVICES_ROUTE as a Tailscale subnet route
-#   3. approves the route in Headscale over SSH
+#   2. enables the NIC UDP GRO forwarding offload (persistent, for throughput)
+#   3. advertises LAN_SERVICES_ROUTE as a Tailscale subnet route
+#   4. approves the route in Headscale over SSH
 #
 # The approval lives in the Headscale database. Re-run this script after the
 # desktop re-registers or after the EC2 instance is re-provisioned (both
@@ -83,14 +84,82 @@ else
     echo "IPv4 forwarding enabled (persisted in ${SYSCTL_FILE})."
 fi
 
-echo "=== 3. Advertising route ${LAN_SERVICES_ROUTE} ==="
+echo "=== 3. Enabling UDP GRO forwarding offload ==="
+# A subnet router forwards the tunnel's UDP packets. The NIC GRO-forwarding
+# offload raises that throughput a lot, and 'tailscale up' warns when it is
+# off. ethtool settings do not survive a reboot, so a helper (which resolves
+# the current uplink at run time, in case it is not the same interface at
+# every boot, e.g. wired vs wifi) is re-run on every boot by a systemd unit.
+# Non-fatal: the route works without it.
+GRO_HELPER="/usr/local/sbin/tunnel-udp-gro"
+GRO_UNIT="/etc/systemd/system/tunnel-udp-gro.service"
+
+# The interface that currently reaches the internet (honours metrics/rules).
+uplink_iface() {
+    ip -o route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+CURRENT_IFACE=$(uplink_iface)
+
+if ! command -v ethtool &>/dev/null; then
+    echo "Warning: ethtool is not installed. Skipping GRO tuning."
+    echo "Install it and re-run this script: sudo pacman -S ethtool"
+elif [ -f "${GRO_HELPER}" ] && [ -f "${GRO_UNIT}" ] && [ -n "${CURRENT_IFACE}" ] \
+    && ethtool -k "${CURRENT_IFACE}" 2>/dev/null | grep -q 'rx-udp-gro-forwarding: on'; then
+    echo "UDP GRO forwarding already enabled on ${CURRENT_IFACE}."
+else
+    # Helper resolves the uplink each time it runs, so it follows a wired/wifi
+    # switch without an interface name pinned anywhere.
+    sudo tee "${GRO_HELPER}" > /dev/null <<'EOF'
+#!/usr/bin/env bash
+# Enable UDP GRO forwarding offload on the current uplink, for Tailscale
+# subnet-router throughput. Installed by tunnel/scripts/03-lan-services.sh.
+set -uo pipefail
+iface=$(ip -o route get 1.1.1.1 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+if [ -z "${iface}" ]; then
+    echo "tunnel-udp-gro: no uplink interface found; nothing to do" >&2
+    exit 0
+fi
+# Some NICs (often wifi) do not support these offloads; tolerate that.
+ethtool -K "${iface}" rx-udp-gro-forwarding on rx-gro-list off || {
+    echo "tunnel-udp-gro: ${iface} does not support the offload; skipped" >&2
+    exit 0
+}
+EOF
+    sudo chmod 0755 "${GRO_HELPER}"
+    sudo tee "${GRO_UNIT}" > /dev/null <<EOF
+[Unit]
+Description=Enable UDP GRO forwarding offload for Tailscale subnet routing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${GRO_HELPER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable tunnel-udp-gro.service > /dev/null 2>&1 || true
+    if sudo systemctl restart tunnel-udp-gro.service; then
+        echo "UDP GRO forwarding enabled on ${CURRENT_IFACE:-the uplink} (persisted via ${GRO_UNIT})."
+    else
+        echo "Warning: could not apply GRO tuning. The route still works; only"
+        echo "forwarded throughput is affected. Inspect with:"
+        echo "  systemctl status tunnel-udp-gro.service"
+    fi
+fi
+
+echo "=== 4. Advertising route ${LAN_SERVICES_ROUTE} ==="
 # 'tailscale set' changes only this preference. Note that vpn-up.sh and
 # 02-configure-clients.sh must pass the same --advertise-routes value:
 # 'tailscale up' rejects a call that omits a non-default preference.
 sudo tailscale set --advertise-routes "${LAN_SERVICES_ROUTE}"
 echo "Route advertised."
 
-echo "=== 4. Approving the route in Headscale ==="
+echo "=== 5. Approving the route in Headscale ==="
 NODE_KEY=$(tailscale status --json | jq -r '.Self.PublicKey // empty')
 if [ -z "${NODE_KEY}" ]; then
     echo "Error: could not read this machine's node key from 'tailscale status'."
@@ -143,7 +212,7 @@ ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" "sudo headscale nodes list-routes" 2>/
     || echo "(could not list routes; check on the server with 'headscale nodes list-routes')"
 
 echo ""
-echo "=== 5. Verifying the route is active on this node ==="
+echo "=== 6. Verifying the route is active on this node ==="
 MAX_WAIT=30; ELAPSED=0
 TIMED_OUT=false
 until tailscale status --json 2>/dev/null | jq -e --arg r "${LAN_SERVICES_ROUTE}" \

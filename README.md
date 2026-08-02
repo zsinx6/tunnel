@@ -255,7 +255,7 @@ Then, one-time on the desktop, with the tunnel up:
 bash scripts/03-lan-services.sh
 ```
 
-This enables IPv4 forwarding on the desktop, advertises `<LAN_SERVICES_HOST>/32`, and approves the route in Headscale. After that, any tailnet device uses the same `IP:port` addresses as at home.
+This enables IPv4 forwarding on the desktop, turns on the uplink NIC's UDP GRO forwarding offload (a throughput boost for forwarded traffic, persisted by a small systemd unit), advertises `<LAN_SERVICES_HOST>/32`, and approves the route in Headscale. After that, any tailnet device uses the same `IP:port` addresses as at home.
 
 Notes:
 
@@ -283,50 +283,6 @@ sudo tunnel-logs
 ```
 
 If the instance was ever re-provisioned, clear the stale host key first: `ssh-keygen -R '[<EIP>]:50022'`.
-
----
-
-## Migrating from the WireGuard version (main branch)
-
-If this AWS deployment (and your desktop) were set up from `main` — the WireGuard hub-and-spoke design — run the migration helper once:
-
-```bash
-bash scripts/migrate-from-main.sh
-```
-
-It is interactive, idempotent, and moves old secrets to `~/wireguard-keys/migration-backup-main/` instead of deleting them. It will:
-
-1. Stop/disable `wg-quick@wg0` and retire `/etc/wireguard/wg0.conf`
-2. Remove the stale `wg-bastion` SSH alias and stale `known_hosts` entries
-3. Retire `peers.auto.tfvars.json` and the old `terraform.tfvars` (which contains the WireGuard server private key)
-4. Retire the obsolete WireGuard key files in `~/wireguard-keys/` (keeping `kms/`)
-5. Re-run the bootstrap (KMS key import, new tfvars, domain prompt)
-
-Then apply and reconnect:
-
-```bash
-terraform -chdir=terraform apply     # replaces the instance, the security group
-                                     # (description change) and the flow log
-                                     # (ALL -> REJECT); destroys SSM params, the
-                                     # old IAM role/profile and key pair;
-                                     # KEEPS the Elastic IP (same address)
-terraform -chdir=terraform output dns_setup   # create the printed A record
-bash scripts/02-configure-clients.sh          # re-register this desktop
-```
-
-Mobile/tablet: the old WireGuard tunnels are dead — delete those WireGuard app profiles and register through the Tailscale app via `add-device.sh`. Once everything works, shred the backup directory **and** the pre-migration state backup — the old design stored the WireGuard server key and PSKs in Terraform state (the script prints the exact commands):
-
-```bash
-shred -u terraform/terraform.tfstate.backup
-```
-
-**Lost the state file?** If the old deployment's `terraform.tfstate` is gone but the infra was never hand-modified, run:
-
-```bash
-bash scripts/destroy-old-main-infra.sh
-```
-
-It rebuilds the state with `terraform import` against a throwaway git worktree of `main` (nothing drifted, so imports are exact), then runs `terraform destroy` — you review the plan and confirm. Afterwards deploy fresh: `01-bootstrap.sh` → `terraform apply` → DNS → `02-configure-clients.sh`. A new Elastic IP is allocated, which is harmless as long as the DNS record hasn't been created yet.
 
 ---
 
@@ -387,8 +343,6 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 │   ├── 02-configure-clients.sh    # Register the desktop with Headscale
 │   ├── 03-lan-services.sh         # Expose a LAN host to the tailnet via a subnet route
 │   ├── add-device.sh              # Generate one-time auth keys for new devices
-│   ├── migrate-from-main.sh       # One-time migration from the WireGuard design
-│   ├── destroy-old-main-infra.sh  # Lost-state recovery: import + destroy the old design
 │   ├── vpn-up.sh                  # Start EC2 + Tailscale
 │   └── vpn-down.sh                # Stop Tailscale + EC2 (verifies the stop)
 ├── terraform/
@@ -412,4 +366,4 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 - **Scoped sudo on the instance:** `wgadmin` can run only `headscale preauthkeys/nodes/users` subcommands and a fixed `tunnel-logs` script (unrestricted `journalctl` is a known root-shell escape via its pager, so it is not granted).
 - **BYOK, honestly:** after import, AWS KMS holds a copy of the key material and uses it for all EBS operations — BYOK does **not** hide data from AWS. Its value here is provenance and the ability to delete the imported material (`aws kms delete-imported-key-material`) as a kill switch. The local copy at `~/wireguard-keys/kms/` exists solely so you can re-import after such a deletion. EBS encryption protects against physical-media exposure, not against the cloud provider.
 - **Updates:** the instance refreshes package lists and installs security updates on every boot (it is powered off for weeks at a time, so this happens at the start of every session), rebooting only for kernel upgrades. Headscale itself is a pinned, checksum-verified release — update `HEADSCALE_VERSION` in `init-ec2.sh.tftpl` periodically and re-provision.
-- **Remote state:** use the S3 backend (`backend.tf.example`) to avoid storing state locally. State contains no private keys in this design (unlike the old WireGuard design — after migrating, shred the old state backup as described above), but treat it as sensitive anyway.
+- **Remote state:** use the S3 backend (`backend.tf.example`) to avoid storing state locally. State contains no private keys in this design, but treat it as sensitive anyway.
