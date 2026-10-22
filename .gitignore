@@ -4,7 +4,7 @@
 # Machine-specific script overrides (LAN host to expose, service cheat sheet)
 scripts/config.local.sh
 
-# Headscale database backups
+# Headscale backups (they hold the server private keys)
 backups/
 
 # Terraform-specific files

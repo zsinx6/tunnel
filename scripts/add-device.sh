@@ -28,8 +28,13 @@ AUTH_ID=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --register)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --register requires an auth-id"
+                show_usage
+                exit 1
+            fi
             AUTH_ID="$2"
-            # Validate auth-id format: must start with hskey- and contain only safe characters
+            # The auth-id goes into a remote shell command, so allow only safe characters.
             if [[ ! "${AUTH_ID}" =~ ^hskey-[a-zA-Z0-9_-]+$ ]]; then
                 echo "Error: Invalid auth-id format."
                 echo "Expected format: hskey-xxxxx (alphanumeric, hyphens, underscores)"
@@ -111,7 +116,7 @@ fi
 if [ -n "${AUTH_ID}" ]; then
     echo ""
     echo "Registering device with auth-id: ${AUTH_ID}"
-    # AUTH_ID is already validated above (line 32-37)
+    # AUTH_ID was checked against a safe pattern during argument parsing.
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${EIP}" \
         "sudo headscale auth register --auth-id '${AUTH_ID}' --user default" 2>"${SSH_ERR}" || {
         echo "Error: failed to register device:"
@@ -139,23 +144,15 @@ if [ -z "${AUTH_KEY}" ]; then
     exit 1
 fi
 
-# Write auth key to secure temp file instead of printing it
-KEY_FILE=$(mktemp)
-chmod 600 "${KEY_FILE}"
-printf '%s' "${AUTH_KEY}" > "${KEY_FILE}"
-trap 'rm -f "${SSH_ERR}" "${KEY_FILE}"' EXIT
-
 echo ""
 echo "Auth key generated (single-use, expires in 15 minutes)."
 echo ""
 echo "=== Linux / desktop device ==="
 echo ""
-echo "On the new device, run:"
+echo "On the new device, run (key is one-time and expires in 15 min, so it is"
+echo "harmless in shell history afterwards):"
 echo ""
-echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --auth-key file:${KEY_FILE} --accept-routes"
-echo ""
-echo "Note: The auth key is stored securely in a temporary file (${KEY_FILE})"
-echo "      and will be automatically deleted when this script exits."
+echo "  sudo tailscale up --login-server ${HEADSCALE_URL} --auth-key ${AUTH_KEY} --accept-routes"
 echo ""
 echo "=== Mobile device (official Tailscale app) ==="
 echo ""
@@ -163,15 +160,14 @@ echo "  Android: Settings -> Accounts menu -> 'Use an alternate server'"
 echo "  iOS:     Settings -> Alternate Coordination Server URL"
 echo ""
 echo "  Option A (Android): sign-in screen -> menu -> 'Use auth key' -> paste"
-echo "  the key from the file: cat ${KEY_FILE}"
+echo "  the key printed above. Done — no server command needed."
 echo ""
 echo "  Option B (browser flow):"
 echo "  1. Enter: ${HEADSCALE_URL}"
 echo "  2. Tap Sign In — a browser page opens showing a registration command,"
 echo "     e.g. on Headscale 0.29:"
 echo "       headscale auth register --auth-id hskey-authreq-... --user USERNAME"
-echo "  3. Run it on the server via SSH, with sudo and USERNAME replaced by 'default':"
-echo "     ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@${EIP} \\"
-echo "       \"sudo headscale auth register --auth-id hskey-authreq-... --user default\""
+echo "  3. Copy the auth-id (hskey-authreq-...) and run on this machine:"
+echo "       bash scripts/add-device.sh --register hskey-authreq-..."
 echo ""
 echo "The device will get an IP in the 100.64.0.0/10 range."

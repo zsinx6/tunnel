@@ -113,10 +113,10 @@ This creates:
 - Optionally, the DNS A record — if you set `route53_zone_id` in `terraform.tfvars`
 
 The instance self-configures via cloud-init on first boot (~3-5 min):
-1. Creates `wgadmin`, hardens SSH onto port 50022 **first** (so a later failure never bricks access), locks the AMI's default `admin` user
+1. Creates `wgadmin`, hardens SSH onto port 50022 **first** (so a later failure never bricks access), sets up the scoped sudo rules for `wgadmin` (so `tunnel-logs` works for debugging), locks the AMI's default `admin` user
 2. Installs packages, configures UFW and fail2ban (systemd backend, port 50022)
-3. Installs Headscale 0.29.2 (checksum-verified) with embedded DERP, `verify_clients` on, and no external DERP map
-4. Installs Caddy, which obtains the Let's Encrypt certificate for your domain
+3. Installs Headscale 0.29.5 (checksum-verified) with embedded DERP, `verify_clients` on, and no external DERP map
+4. Installs Caddy, which obtains the Let's Encrypt certificate for your domain and does not expose Headscale's admin API (`/api`)
 5. Reboots only if a kernel upgrade was installed
 
 ### Step 5 — Point DNS at the relay (skip if using Route53)
@@ -253,32 +253,37 @@ bash scripts/remove-device.sh --expire my-tablet
 bash scripts/remove-device.sh --force old-device
 ```
 
-The script will search for the device by name, hostname, or IP address, confirm the action, and remove it from Headscale.
+The script looks for a node whose name, hostname, or Tailscale IP is exactly the value you give (letter case does not matter). Node names are unique, so a name match wins over a hostname match. It shows the node, asks for confirmation, removes it, and checks that it is gone. If several nodes share the hostname you give, it stops and lists them; run it again with the name or IP of the node to remove.
 
 ---
 
 ## Backing Up Devices
 
-Before re-provisioning the EC2 instance (which wipes the Headscale database), back up your device registrations:
+Before re-provisioning the EC2 instance (which wipes the Headscale state), back up your device registrations:
 
 ```bash
-# Create a backup
+# Create a backup in backups/
 bash scripts/backup-headscale.sh --backup
 
 # List available backups
 bash scripts/backup-headscale.sh --list
 
-# Restore after re-provisioning
-bash scripts/backup-headscale.sh --restore backups/headscale-db-2024-01-15.sqlite
+# Restore after re-provisioning (a file name in backups/, or a path)
+bash scripts/backup-headscale.sh --restore headscale-2026-01-15_120000.tar.gz
 ```
 
-The backup copies the entire SQLite database (`db.sqlite`), preserving:
-- All registered devices and their WireGuard public keys
-- User accounts and auth keys
-- Route approvals
-- DERP configuration
+A backup is a `.tar.gz` with:
+- `db.sqlite` — the Headscale database: registered devices (public keys only), users, auth keys, and approved routes. The copy is consistent, and Headscale keeps running while it is made.
+- `noise_private.key` and `derp_server_private.key` — the server private keys. With them, the new instance has the same server identity as the old one.
 
-After restore, devices should automatically reconnect without needing to re-register.
+The server keys are secrets: keep backups as safe as an SSH private key. The script creates them readable by you only, and `backups/` is gitignored.
+
+Restore first saves the current state to `backups/` (as `headscale-<time>-before-restore.tar.gz`), so you can undo it by restoring that file. Then, on the instance, it checks the archive, stops Headscale, installs the backup, starts Headscale, and waits until Headscale reports healthy. If a step fails or Headscale does not become healthy, the instance puts the previous state back. After a restore, devices and approved routes come back without re-registration; a device that stays offline needs a Tailscale restart.
+
+Limits:
+- Restore onto the same domain (devices keep the URL they registered with), and onto the same or a newer Headscale version. Headscale updates an older database when it starts; a database from a newer version is not supported.
+- Backup and restore use the `tunnel-backup` and `tunnel-restore` helpers, which an instance gets when it is provisioned. An instance provisioned from an older version of this repo does not have them; the script says so, and that instance cannot be backed up.
+- After a suspected compromise of the instance, do not restore. A backup brings back everything in it, including the server keys and anything an attacker added to the database. Re-provision and register the devices again instead.
 
 ---
 
@@ -355,11 +360,11 @@ If the instance was ever re-provisioned, clear the stale host key first: `ssh-ke
 
 ## Re-provisioning Caveats
 
-Replacing the EC2 instance (changing `user_data`, or `terraform destroy`/`apply`) wipes the Headscale database and host keys:
+Replacing the EC2 instance (changing `user_data`, or `terraform destroy`/`apply`) wipes the Headscale state and host keys:
 
-- **Backup first!** Use `bash scripts/backup-headscale.sh --backup` before re-provisioning, then restore with `--restore` after.
-- **All devices must re-register** (`02-configure-clients.sh` / `add-device.sh`) — unless you restore from backup.
-- **A LAN-host subnet route loses its approval** — if you use one, run `03-lan-services.sh` again after re-registering the desktop.
+- **Back up first** with `bash scripts/backup-headscale.sh --backup` (see [Backing Up Devices](#backing-up-devices)). After the new instance is up, clear the old SSH host key (below), then run `--restore`.
+- **Without a backup, all devices must re-register** (`02-configure-clients.sh` / `add-device.sh`).
+- **Without a backup, a LAN-host subnet route loses its approval** — if you use one, run `03-lan-services.sh` again after re-registering the desktop.
 - **SSH host keys change** — run `ssh-keygen -R '[<EIP>]:50022'` before reconnecting.
 - The AMI is intentionally **not** tracked (`ignore_changes = [ami]`), so a new upstream Debian AMI release does not force a surprise replacement. Side effect: a replacement re-creates the instance with the AMI recorded in state; if Debian has deregistered that AMI by then, the apply fails — temporarily remove `ignore_changes = [ami]` to pick up the current AMI and re-apply.
 - The Let's Encrypt certificate is re-issued automatically on the new instance (same domain).
@@ -412,10 +417,10 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 │   ├── 03-lan-services.sh         # Expose a LAN host to the tailnet via a subnet route
 │   ├── add-device.sh              # Generate one-time auth keys for new devices (+ auto-register mobile)
 │   ├── remove-device.sh           # Remove or expire devices from the tailnet
-│   ├── backup-headscale.sh        # Backup and restore Headscale database
+│   ├── backup-headscale.sh        # Back up and restore the Headscale state (database + server keys)
 │   ├── vpn-up.sh                  # Start EC2 + Tailscale
 │   └── vpn-down.sh                # Stop Tailscale + EC2 (verifies the stop)
-├── backups/                       # Database backups (created by backup-headscale.sh) — gitignored
+├── backups/                       # Headscale backups (created by backup-headscale.sh) — gitignored
 ├── terraform/
 │   ├── main.tf                    # VPC, SG, EC2, EIP, Flow Logs, optional Route53 record
 │   ├── variables.tf               # Input variables (SSH key, KMS key, domain, region)
@@ -433,8 +438,9 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 
 - **No WireGuard private keys on EC2:** Headscale only stores public keys. Your devices' private keys exist only on your devices.
 - **TLS key stays on the box:** Caddy generates the TLS private key on the instance; Let's Encrypt only ever receives a CSR. Clients verify the certificate normally — there is no flag to skip TLS verification in Tailscale, and none is needed.
-- **DERP is not an open relay:** `verify_clients: true` restricts relaying to nodes registered in your Headscale. Registration itself requires operator-generated keys (single-use, 15-minute expiry, passed via `--auth-key file:` so they never appear in process listings).
-- **Scoped sudo on the instance:** `wgadmin` can run only `headscale preauthkeys/nodes/users` subcommands and a fixed `tunnel-logs` script (unrestricted `journalctl` is a known root-shell escape via its pager, so it is not granted).
+- **DERP is not an open relay:** `verify_clients: true` restricts relaying to nodes registered in your Headscale. Registration itself requires operator-generated keys (single-use, 15-minute expiry). The desktop's key is passed via `--auth-key file:`, so it never appears in process listings; `add-device.sh` prints the key for a new device, for one use on that device.
+- **Scoped sudo on the instance:** `wgadmin` can run only `headscale preauthkeys/nodes/users/auth` subcommands and three fixed scripts: `tunnel-logs` (unrestricted `journalctl` is a known root-shell escape via its pager, so it is not granted), and `tunnel-backup` / `tunnel-restore`. `tunnel-restore` accepts only an archive with the three expected regular files, each at most 64 MiB, so it cannot write anywhere else. Note that these helpers let `wgadmin` read the server private keys and replace the whole database.
+- **Admin API not exposed:** Caddy answers `404` for Headscale's `/api` admin API, so an API key gives no access from outside the instance. The scripts use the CLI over SSH instead.
 - **BYOK, honestly:** after import, AWS KMS holds a copy of the key material and uses it for all EBS operations — BYOK does **not** hide data from AWS. Its value here is provenance and the ability to delete the imported material (`aws kms delete-imported-key-material`) as a kill switch. The local copy at `~/wireguard-keys/kms/` exists solely so you can re-import after such a deletion. EBS encryption protects against physical-media exposure, not against the cloud provider.
 - **Updates:** the instance refreshes package lists and installs security updates on every boot (it is powered off for weeks at a time, so this happens at the start of every session), rebooting only for kernel upgrades. Headscale itself is a pinned, checksum-verified release — update `HEADSCALE_VERSION` in `init-ec2.sh.tftpl` periodically and re-provision.
 - **Remote state:** use the S3 backend (`backend.tf.example`) to avoid storing state locally. State contains no private keys in this design, but treat it as sensitive anyway.

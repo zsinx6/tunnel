@@ -7,14 +7,15 @@ set -euo pipefail
 # No WireGuard private keys on this instance — only public keys in Headscale.
 # TLS: Caddy obtains a Let's Encrypt certificate for ${headscale_domain}.
 #
-# Ordering matters: SSH access (user + port 50022) is configured FIRST, so any
-# failure in the later steps still leaves an SSH-reachable instance for
-# debugging instead of a bricked one (the security group does not allow the
-# default port 22 — for SSH it only allows 50022).
+# Ordering matters: SSH access (user + port 50022) is configured FIRST, and the
+# operator's scoped sudo right after it, so any failure in the later steps
+# still leaves an SSH-reachable instance with tunnel-logs for debugging instead
+# of a bricked one (the security group does not allow the default port 22 —
+# for SSH it only allows 50022).
 # ==============================================================================
 
 NEW_USER="wgadmin"
-HEADSCALE_VERSION="0.29.2"
+HEADSCALE_VERSION="0.29.5"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -72,16 +73,194 @@ if id admin &>/dev/null; then
     echo "Default 'admin' user locked."
 fi
 
-# --- 2. Base packages ---------------------------------------------------------
+# --- 2. Scoped sudo for the operator user --------------------------------------
+
+# Right after SSH, so tunnel-logs works for debugging when a later step fails.
+# The helpers below run only when the operator calls them, so the tools they
+# use (sqlite3, curl, the headscale user) do not have to exist yet.
+
+# Fixed-argument log reader: avoids granting unrestricted journalctl, whose
+# root pager is a shell-escape vector.
+cat <<'EOM' > /usr/local/bin/tunnel-logs
+#!/usr/bin/env bash
+exec journalctl -u headscale -u caddy -u fail2ban --no-pager -n 300
+EOM
+chmod 755 /usr/local/bin/tunnel-logs
+
+# Fixed-argument backup and restore of the Headscale state (database + server
+# private keys), used by scripts/backup-headscale.sh. They give the operator
+# no general access to /var/lib/headscale or to systemctl. Root does not
+# follow a symbolic link that the headscale user can plant: it copies
+# Headscale's files with cp -P and installs only its own copies. sqlite3 skips
+# ~/.sqliterc, which the Headscale daemon can write.
+cat <<'EOM' > /usr/local/bin/tunnel-backup
+#!/usr/bin/env bash
+# Writes a tar.gz of the Headscale state to stdout. Headscale keeps running.
+set -euo pipefail
+umask 077
+state_dir=/var/lib/headscale
+# One backup or restore at a time.
+exec 9>/run/tunnel-state.lock
+flock -n 9 || { echo "Error: another backup or restore is running." >&2; exit 1; }
+work=$(mktemp -d)
+trap 'rm -rf "$${work}"' EXIT
+# The headscale user writes the database copy into its own subdirectory. It
+# can pass through the root-owned work directory, but not list or change it.
+install -d -m 700 -o headscale -g headscale "$${work}/db"
+chmod 711 "$${work}"
+# VACUUM INTO writes one consistent file that includes the changes still in
+# the WAL file. It runs as the headscale user, so SQLite cannot leave
+# root-owned -wal or -shm files that Headscale is then unable to open.
+runuser -u headscale -- sqlite3 -init /dev/null -cmd ".timeout 10000" \
+    "$${state_dir}/db.sqlite" "VACUUM INTO '$${work}/db/db.sqlite'"
+# Take the subdirectory and the copy back before root reads from them.
+chown root:root "$${work}/db"
+chmod 700 "$${work}/db"
+if [ -L "$${work}/db/db.sqlite" ] || [ ! -f "$${work}/db/db.sqlite" ]; then
+    echo "Error: the database copy is not a regular file." >&2
+    exit 1
+fi
+chown root:root "$${work}/db/db.sqlite"
+mv "$${work}/db/db.sqlite" "$${work}/db.sqlite"
+# -P copies a symbolic link as a link, never the file it points to; the
+# archive checks on both ends then reject the backup.
+cp -P "$${state_dir}/noise_private.key" "$${state_dir}/derp_server_private.key" "$${work}/"
+tar -czf - -C "$${work}" db.sqlite noise_private.key derp_server_private.key
+EOM
+chmod 755 /usr/local/bin/tunnel-backup
+
+cat <<'EOM' > /usr/local/bin/tunnel-restore
+#!/usr/bin/env bash
+# Replaces the Headscale state with a tunnel-backup archive read from stdin.
+# If Headscale does not become healthy with it, the previous state comes back.
+set -euo pipefail
+umask 077
+state_dir=/var/lib/headscale
+files=(db.sqlite noise_private.key derp_server_private.key)
+max_bytes=$((64 * 1024 * 1024))
+# One backup or restore at a time.
+exec 9>/run/tunnel-state.lock
+flock -n 9 || { echo "Error: another backup or restore is running." >&2; exit 1; }
+work=$(mktemp -d)
+keep=""
+stopped=false
+changed=false
+finished=false
+
+on_exit() {
+    # Run every step, even if one of them fails.
+    set +e
+    if ! $${finished}; then
+        if $${changed}; then
+            echo "Restore failed. Putting back the previous state." >&2
+            systemctl stop headscale
+            rm -f "$${state_dir}/db.sqlite" "$${state_dir}/db.sqlite-wal" "$${state_dir}/db.sqlite-shm"
+            if cp -a "$${keep}/." "$${state_dir}/"; then
+                rm -rf "$${keep}"
+            else
+                echo "Error: could not put back the previous state. It is in $${keep}." >&2
+            fi
+        elif [ -n "$${keep}" ]; then
+            # The state was not changed, and this copy can be incomplete.
+            rm -rf "$${keep}"
+        fi
+        if $${stopped}; then
+            systemctl start headscale
+        fi
+    fi
+    rm -rf "$${work}"
+}
+trap on_exit EXIT
+
+head -c "$((max_bytes + 1))" > "$${work}/backup.tar.gz"
+if [ "$(stat -c %s "$${work}/backup.tar.gz")" -gt "$${max_bytes}" ]; then
+    echo "Error: the archive is larger than $${max_bytes} bytes." >&2
+    exit 1
+fi
+
+# Root extracts an archive that a less privileged user supplies. Accept only
+# the expected file names, and only regular files: no links, no directories.
+names=$(tar -tzf "$${work}/backup.tar.gz" | sort) || {
+    echo "Error: the input is not a tar.gz archive." >&2
+    exit 1
+}
+if [ "$${names}" != "$(printf '%s\n' "$${files[@]}" | sort)" ]; then
+    echo "Error: the archive must hold exactly: $${files[*]}" >&2
+    exit 1
+fi
+listing=$(tar -tvzf "$${work}/backup.tar.gz")
+if grep -qv '^-' <<<"$${listing}"; then
+    echo "Error: the archive must hold only regular files." >&2
+    exit 1
+fi
+mkdir "$${work}/new"
+# The file size limit stops a small archive from filling the disk. With
+# SIGXFSZ ignored, tar gets a "File too large" error instead of being killed.
+if ! (trap '' XFSZ; ulimit -f "$((max_bytes / 1024))"; tar -xzf "$${work}/backup.tar.gz" -C "$${work}/new" \
+        --no-same-owner --no-same-permissions -- "$${files[@]}"); then
+    echo "Error: could not extract the archive. Each file must be at most $${max_bytes} bytes." >&2
+    exit 1
+fi
+# The headscale user checks a copy of the database in its own subdirectory.
+# Root installs only the files in work/new, which only root can change.
+install -d -m 700 -o headscale -g headscale "$${work}/check"
+chmod 711 "$${work}"
+install -m 600 -o headscale -g headscale "$${work}/new/db.sqlite" "$${work}/check/db.sqlite"
+if [ "$(runuser -u headscale -- sqlite3 -init /dev/null -safe "$${work}/check/db.sqlite" 'PRAGMA integrity_check;')" != "ok" ]; then
+    echo "Error: the database in the archive failed the SQLite integrity check." >&2
+    exit 1
+fi
+
+stopped=true
+systemctl stop headscale
+keep=$(mktemp -d "$${state_dir}.before-restore-XXXXXX")
+cp -a "$${state_dir}/." "$${keep}/"
+# From here on, a failure puts the copy back.
+changed=true
+# A WAL file left by the old database would be applied to the new one.
+rm -f "$${state_dir}/db.sqlite" "$${state_dir}/db.sqlite-wal" "$${state_dir}/db.sqlite-shm"
+for f in "$${files[@]}"; do
+    rm -f "$${state_dir}/$${f}"
+    install -o headscale -g headscale -m 600 "$${work}/new/$${f}" "$${state_dir}/$${f}"
+done
+systemctl start headscale
+# The unit is Type=simple: start returns when the process runs, not when it
+# works. /health also checks the database.
+healthy=false
+for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+        healthy=true
+        break
+    fi
+    sleep 2
+done
+if ! $${healthy}; then
+    echo "Error: Headscale did not become healthy with the restored state." >&2
+    exit 1
+fi
+finished=true
+rm -rf "$${keep}"
+echo "Headscale state replaced."
+EOM
+chmod 755 /usr/local/bin/tunnel-restore
+
+cat > "/etc/sudoers.d/$${NEW_USER}" <<EOM
+$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/tunnel-logs, /usr/local/bin/tunnel-backup, /usr/local/bin/tunnel-restore, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *, /usr/bin/headscale auth *
+EOM
+chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
+visudo -cf "/etc/sudoers.d/$${NEW_USER}"
+echo "Sudo configured for $${NEW_USER}."
+
+# --- 3. Base packages ---------------------------------------------------------
 
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y ufw fail2ban python3-systemd curl jq ca-certificates gnupg \
+apt-get install -y ufw fail2ban python3-systemd curl jq ca-certificates gnupg sqlite3 \
     unattended-upgrades debian-keyring debian-archive-keyring apt-transport-https
 echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
 dpkg-reconfigure -f noninteractive unattended-upgrades
 
-# --- 3. Kernel hardening (no IP forwarding: DERP relays in userspace) ---------
+# --- 4. Kernel hardening (no IP forwarding: DERP relays in userspace) ---------
 
 cat <<EOM > /etc/sysctl.d/99-security-routing.conf
 net.ipv4.conf.all.accept_source_route=0
@@ -95,7 +274,7 @@ net.ipv6.conf.default.disable_ipv6=1
 EOM
 sysctl --system
 
-# --- 4. Firewall ---------------------------------------------------------------
+# --- 5. Firewall ---------------------------------------------------------------
 
 ufw default deny incoming
 ufw default allow outgoing
@@ -105,7 +284,7 @@ ufw allow 443/tcp comment 'Headscale API + DERP HTTPS'
 ufw allow 3478/udp comment 'DERP STUN'
 ufw --force enable
 
-# --- 5. fail2ban (systemd backend: Debian cloud images have no auth.log) ------
+# --- 6. fail2ban (systemd backend: Debian cloud images have no auth.log) ------
 
 cat <<EOM > /etc/fail2ban/jail.local
 [sshd]
@@ -119,7 +298,7 @@ EOM
 systemctl enable --now fail2ban
 systemctl restart fail2ban
 
-# --- 6. Headscale --------------------------------------------------------------
+# --- 7. Headscale --------------------------------------------------------------
 
 echo "Installing Headscale $${HEADSCALE_VERSION}..."
 curl -fsSL "https://github.com/juanfont/headscale/releases/download/v$${HEADSCALE_VERSION}/headscale_$${HEADSCALE_VERSION}_linux_amd64.deb" -o /tmp/headscale.deb
@@ -206,7 +385,7 @@ if ! headscale users list --output json | jq -e '.[] | select(.name == "default"
     echo "Headscale user 'default' created."
 fi
 
-# --- 7. Caddy (TLS termination with Let's Encrypt) -----------------------------
+# --- 8. Caddy (TLS termination with Let's Encrypt) -----------------------------
 
 echo "Installing Caddy..."
 mkdir -p /etc/apt/keyrings
@@ -219,8 +398,13 @@ apt-get install -y caddy
 # with backoff until the DNS A record for the domain points at this host, so a
 # missing record at first boot self-heals once DNS is set up. The TLS private
 # key is generated here and never leaves this instance.
+# /api is Headscale's admin API. Nothing here uses it remotely (the scripts
+# run the CLI over SSH), so it is not exposed: an API key, even a valid one,
+# gives no access from outside.
 cat <<EOM > /etc/caddy/Caddyfile
 ${headscale_domain} {
+    @api path /api /api/*
+    respond @api 404
     reverse_proxy 127.0.0.1:8080
 }
 EOM
@@ -228,23 +412,6 @@ EOM
 systemctl enable caddy
 systemctl restart caddy
 echo "Caddy configured for https://${headscale_domain} (ACME happens in background)."
-
-# --- 8. Scoped sudo for the operator user --------------------------------------
-
-# Fixed-argument log reader: avoids granting unrestricted journalctl, whose
-# root pager is a shell-escape vector.
-cat <<'EOM' > /usr/local/bin/tunnel-logs
-#!/usr/bin/env bash
-exec journalctl -u headscale -u caddy -u fail2ban --no-pager -n 300
-EOM
-chmod 755 /usr/local/bin/tunnel-logs
-
-cat > "/etc/sudoers.d/$${NEW_USER}" <<EOM
-$${NEW_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/tunnel-logs, /usr/bin/headscale preauthkeys *, /usr/bin/headscale nodes *, /usr/bin/headscale users *, /usr/bin/headscale auth *, /usr/local/bin/headscale preauthkeys *, /usr/local/bin/headscale nodes *, /usr/local/bin/headscale users *, /usr/local/bin/headscale auth *
-EOM
-chmod 0440 "/etc/sudoers.d/$${NEW_USER}"
-visudo -cf "/etc/sudoers.d/$${NEW_USER}"
-echo "Sudo configured for $${NEW_USER}."
 
 # --- 9. Security updates on every boot ------------------------------------------
 
