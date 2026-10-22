@@ -209,9 +209,76 @@ bash scripts/add-device.sh
 This checks that Headscale is reachable, generates a **single-use, 15-minute** auth key, and prints setup instructions:
 
 - **Linux/desktop:** one `tailscale up` command with the key (safe to have in history — single-use and expired within 15 minutes).
-- **Mobile:** the **official Tailscale app** supports custom coordination servers — Android: "Use an alternate server"; iOS: "Alternate Coordination Server URL". Enter your Headscale URL, then either sign in with the auth key directly (Android: sign-in menu → "Use auth key") or use the browser flow: sign in and run the registration command the page shows via SSH with sudo, replacing `USERNAME` with `default` (on Headscale 0.29: `headscale auth register --auth-id hskey-authreq-... --user default`). No certificate installation is needed.
+- **Mobile:** the **official Tailscale app** supports custom coordination servers — Android: "Use an alternate server"; iOS: "Alternate Coordination Server URL". Enter your Headscale URL, then either sign in with the auth key directly (Android: sign-in menu → "Use auth key") or use the browser flow.
+
+### Simplified Mobile Registration
+
+For mobile devices using the browser flow (both Android and iOS):
+
+1. In the mobile app, enter your Headscale URL and tap Sign In
+2. A browser page opens showing a registration command like:
+   ```
+   headscale auth register --auth-id hskey-authreq-... --user default
+   ```
+3. Copy the `hskey-authreq-...` part (the auth-id)
+4. Run this command on your desktop to complete registration automatically:
+   ```bash
+   bash scripts/add-device.sh --register hskey-authreq-abc123
+   ```
+
+No manual SSH required — the script handles everything.
 
 > Headscale must be running (EC2 must be up) to generate auth keys. Start the tunnel first with `vpn-up.sh`.
+
+---
+
+## Removing Devices
+
+To remove a device from your Tailscale network:
+
+```bash
+# List all registered nodes
+bash scripts/remove-device.sh --list
+
+# Remove a device by name
+bash scripts/remove-device.sh my-phone
+
+# Remove a device by IP
+bash scripts/remove-device.sh 100.64.0.5
+
+# Expire instead of delete (softer, can re-register later)
+bash scripts/remove-device.sh --expire my-tablet
+
+# Skip confirmation prompt
+bash scripts/remove-device.sh --force old-device
+```
+
+The script will search for the device by name, hostname, or IP address, confirm the action, and remove it from Headscale.
+
+---
+
+## Backing Up Devices
+
+Before re-provisioning the EC2 instance (which wipes the Headscale database), back up your device registrations:
+
+```bash
+# Create a backup
+bash scripts/backup-headscale.sh --backup
+
+# List available backups
+bash scripts/backup-headscale.sh --list
+
+# Restore after re-provisioning
+bash scripts/backup-headscale.sh --restore backups/headscale-db-2024-01-15.sqlite
+```
+
+The backup copies the entire SQLite database (`db.sqlite`), preserving:
+- All registered devices and their WireGuard public keys
+- User accounts and auth keys
+- Route approvals
+- DERP configuration
+
+After restore, devices should automatically reconnect without needing to re-register.
 
 ---
 
@@ -290,7 +357,8 @@ If the instance was ever re-provisioned, clear the stale host key first: `ssh-ke
 
 Replacing the EC2 instance (changing `user_data`, or `terraform destroy`/`apply`) wipes the Headscale database and host keys:
 
-- **All devices must re-register** (`02-configure-clients.sh` / `add-device.sh`).
+- **Backup first!** Use `bash scripts/backup-headscale.sh --backup` before re-provisioning, then restore with `--restore` after.
+- **All devices must re-register** (`02-configure-clients.sh` / `add-device.sh`) — unless you restore from backup.
 - **A LAN-host subnet route loses its approval** — if you use one, run `03-lan-services.sh` again after re-registering the desktop.
 - **SSH host keys change** — run `ssh-keygen -R '[<EIP>]:50022'` before reconnecting.
 - The AMI is intentionally **not** tracked (`ignore_changes = [ami]`), so a new upstream Debian AMI release does not force a surprise replacement. Side effect: a replacement re-creates the instance with the AMI recorded in state; if Debian has deregistered that AMI by then, the apply fails — temporarily remove `ignore_changes = [ami]` to pick up the current AMI and re-apply.
@@ -342,9 +410,12 @@ This deletes the EC2 instance, Elastic IP, VPC, IAM role, and flow logs. Your lo
 │   ├── 01-bootstrap.sh            # Local setup: packages, KMS keys, SSH key, tfvars (incl. domain)
 │   ├── 02-configure-clients.sh    # Register the desktop with Headscale
 │   ├── 03-lan-services.sh         # Expose a LAN host to the tailnet via a subnet route
-│   ├── add-device.sh              # Generate one-time auth keys for new devices
+│   ├── add-device.sh              # Generate one-time auth keys for new devices (+ auto-register mobile)
+│   ├── remove-device.sh           # Remove or expire devices from the tailnet
+│   ├── backup-headscale.sh        # Backup and restore Headscale database
 │   ├── vpn-up.sh                  # Start EC2 + Tailscale
 │   └── vpn-down.sh                # Stop Tailscale + EC2 (verifies the stop)
+├── backups/                       # Database backups (created by backup-headscale.sh) — gitignored
 ├── terraform/
 │   ├── main.tf                    # VPC, SG, EC2, EIP, Flow Logs, optional Route53 record
 │   ├── variables.tf               # Input variables (SSH key, KMS key, domain, region)
